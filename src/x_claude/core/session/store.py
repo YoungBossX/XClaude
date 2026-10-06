@@ -5,7 +5,9 @@ import logging
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
+from x_claude.core.atomic_file import atomic_write_bytes
 from x_claude.core.session.model import Session
 
 logger = logging.getLogger(__name__)
@@ -77,20 +79,26 @@ class SessionStore:
         with (path / "thread.jsonl").open("a", encoding="utf-8") as f:
             f.write(json.dumps(row, ensure_ascii=False) + "\n")
 
-    # 批量追加一次 run 新产生的消息到 thread.jsonl
+    # 将一次运行产生的消息完整序列化，再原子追加到历史文件以避免半批消息
     def append_messages(
         self,
         sid: str,
         messages: list[dict[str, Any]],
         run_id: str,
     ) -> None:
-        for msg in messages:
-            self.append_message(
-                sid,
-                role=str(msg["role"]),
-                content=msg["content"],
-                run_id=run_id,
-            )
+        if not messages:
+            return
+        rows = [
+            json.dumps(
+                {"ts": _now(), "role": str(msg["role"]),
+                 "content": msg["content"], "run_id": run_id},
+                ensure_ascii=False,
+            ) + "\n"
+            for msg in messages
+        ]
+        path = self.session_dir(sid) / "thread.jsonl"
+        original = path.read_bytes() if path.exists() else b""
+        atomic_write_bytes(path, original + "".join(rows).encode("utf-8"))
 
     # 读取完整 thread 并返回可直接传给 Anthropic 的 messages
     def read_messages(self, sid: str) -> list[dict[str, Any]]:
@@ -144,17 +152,22 @@ class SessionStore:
             return messages[:last_balanced]
         return messages
 
-    # 将压缩后的消息对覆盖写入 thread.jsonl，原文件备份为 thread_<ts>.jsonl.bak
+    # 完整序列化新历史，保存独立备份，再原子替换 thread.jsonl，任一提交前失败都保留原历史
     def write_compacted(self, sid: str, messages: list[dict[str, Any]]) -> None:
         path = self.session_dir(sid) / "thread.jsonl"
-        ts_str = datetime.now(UTC).strftime("%Y%m%d_%H%M%S")
-        bak = self.session_dir(sid) / f"thread_{ts_str}.jsonl.bak"
+        rows = [
+            json.dumps(
+                {"ts": _now(), "role": msg["role"], "content": msg["content"]},
+                ensure_ascii=False,
+            ) + "\n"
+            for msg in messages
+        ]
+        payload = "".join(rows).encode("utf-8")
+        ts_str = datetime.now(UTC).strftime("%Y%m%d_%H%M%S_%f")
+        bak = self.session_dir(sid) / f"thread_{ts_str}_{uuid4().hex}.jsonl.bak"
         if path.exists():
-            path.rename(bak)
-        with path.open("w", encoding="utf-8") as f:
-            for msg in messages:
-                row: dict[str, Any] = {"ts": _now(), "role": msg["role"], "content": msg["content"]}
-                f.write(json.dumps(row, ensure_ascii=False) + "\n")
+            atomic_write_bytes(bak, path.read_bytes())
+        atomic_write_bytes(path, payload)
 
     # 读取 notes.md 全文，文件不存在时返回空字符串
     def read_notes(self, sid: str) -> str:

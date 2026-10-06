@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 from pathlib import Path
 from unittest.mock import AsyncMock
@@ -108,6 +109,68 @@ async def _run(
 
 
 # --- tests -------------------------------------------------------------------
+
+
+# 功能：验证自动压缩取消在外层标记失败，提交前后均可从一致的磁盘历史恢复
+# 设计：对真实 runner 在摘要生成和完成通知阶段分别取消，通过 run.finished 和历史备份检查状态
+@pytest.mark.parametrize("after_commit", [False, True])
+async def test_auto_compaction_cancellation_records_status(
+    tmp_path: Path, after_commit: bool,
+) -> None:
+    from x_claude.core.session.model import Session
+    from x_claude.core.session.store import SessionStore
+
+    store = SessionStore(tmp_path / "sessions")
+    session = Session(
+        id="sess-cancel", mode="chat", status="active", title="",
+        created_at="t", updated_at="t",
+    )
+    store.append_message(session.id, "user", "original")
+    entered = asyncio.Event()
+    events: list[BaseModel] = []
+
+    # 在模型摘要生成阶段发出屏障，或返回完整摘要等待通知阶段取消
+    async def chat(
+        messages: list[dict[str, object]], tool_schemas: list[dict[str, object]],
+        bus: EventBus, run_id: str, *, step: int = 0, system: str | None = None,
+    ) -> LlmResponse:
+        if run_id == "compact":
+            if not after_commit:
+                entered.set()
+                await asyncio.Event().wait()
+            return LlmResponse(stop_reason="end_turn", text="saved summary")
+        return LlmResponse(
+            stop_reason="tool_use",
+            tool_calls=[ToolCallBlock(id="t1", name="unknown", input={})],
+            usage=UsageStats(input_tokens=160_000, output_tokens=10, context_pct=0.8),
+        )
+
+    # 收集终止状态，并在压缩已提交的通知阶段发出取消屏障
+    async def collect(event: BaseModel) -> None:
+        events.append(event)
+        if after_commit and getattr(event, "type", "") == "context.compacted":
+            entered.set()
+            await asyncio.Event().wait()
+
+    provider = _CapturingProvider(LlmResponse(stop_reason="end_turn"))
+    provider.chat = AsyncMock(side_effect=chat)  # type: ignore[method-assign]
+    runner = AgentRunner(
+        _config(), provider=provider, extra_handlers=[collect], runs_dir=tmp_path / "runs",
+    )
+    task = asyncio.create_task(runner.run_and_capture(
+        "original", run_id="run-cancel", session=session, store=store,
+    ))
+    await asyncio.wait_for(entered.wait(), timeout=2)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    finished = next(event for event in events if getattr(event, "type", "") == "run.finished")
+    assert getattr(finished, "status") == "failed"
+    assert getattr(finished, "reason") == "cancelled"
+    persisted = store.read_messages(session.id)
+    assert persisted[0]["content"] == ("saved summary" if after_commit else "original")
+    backups = list(store.session_dir(session.id).glob("thread_*.jsonl.bak"))
+    assert len(backups) == int(after_commit)
 
 
 # 功能：验证默认自动压缩的触发边界、终止保护、失败降级及会话续接持久化

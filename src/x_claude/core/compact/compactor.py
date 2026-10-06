@@ -1,17 +1,20 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from x_claude.core.atomic_file import atomic_write_bytes
 from x_claude.core.bus.events import ContextCompactedEvent
 from x_claude.core.events.bus import EventBus
 
 if TYPE_CHECKING:
     from x_claude.core.context import ExecutionContext
     from x_claude.core.llm.base import LLMProvider
+    from x_claude.core.session.store import SessionStore
 
 logger = logging.getLogger(__name__)
 
@@ -47,7 +50,7 @@ Be concise. Omit reasoning steps and intermediate attempts. Keep conclusions.\
 
 # 返回当前 UTC 时间的简短时间戳字符串（用于文件名）
 def _ts_compact() -> str:
-    return datetime.now(UTC).strftime("%Y%m%d_%H%M%S")
+    return datetime.now(UTC).strftime("%Y%m%d_%H%M%S_%f")
 
 
 # 返回当前 UTC 时间的 ISO 8601 字符串
@@ -64,12 +67,17 @@ class CompactionResult:
 
 class Compactor:
     # 初始化压缩器，绑定事件总线、session 目录和 session ID
-    def __init__(self, bus: EventBus, session_dir: Path, session_id: str) -> None:
+    def __init__(
+        self, bus: EventBus, session_dir: Path, session_id: str,
+        *, store: SessionStore | None = None, timeout_s: float = 60.0,
+    ) -> None:
         self._bus = bus
         self._session_dir = session_dir
         self._session_id = session_id
+        self._store = store
+        self._timeout_s = timeout_s
 
-    # 压缩 ExecutionContext.messages，就地替换消息列表并写 summary 文件
+    # 先保存摘要和可选会话历史，再无等待地切换内存上下文，最后发送可隔离异常的完成通知
     async def compact(
         self,
         context: ExecutionContext,
@@ -80,11 +88,19 @@ class Compactor:
         if result is None:
             return None
 
-        context.messages = [
+        await asyncio.sleep(0)  # 在同步提交前交付待处理的取消，提交区间内不再让出执行权
+        new_messages: list[dict[str, Any]] = [
             {"role": "user", "content": result.summary_text},
             {"role": "assistant", "content": "Understood, I'll continue from this summary."},
         ]
-        self._write_summary(result.summary_text)
+        try:
+            self._write_summary(result.summary_text)
+            if self._store is not None:
+                self._store.write_compacted(self._session_id, new_messages)
+        except Exception:
+            logger.exception("compactor: persistence failed, retaining original history")
+            return None
+        context.messages = new_messages
         await self._bus.publish(
             ContextCompactedEvent(
                 session_id=self._session_id,
@@ -92,7 +108,8 @@ class Compactor:
                 original_tokens=result.original_token_estimate,
                 summary_tokens=result.summary_tokens,
                 ts=_now(),
-            )
+            ),
+            isolate_errors=True,
         )
         logger.info(
             "context compacted session=%s run=%s original≈%d summary=%d tokens",
@@ -125,21 +142,22 @@ class Compactor:
 
         try:
             silent_bus = _Bus()
-            response = await provider.chat(
-                messages=compress_request,
-                tool_schemas=[],
-                bus=silent_bus,
-                run_id="compact",
-                step=0,
-                system="You are a helpful assistant that summarizes conversations.",
-            )
+            async with asyncio.timeout(self._timeout_s):
+                response = await provider.chat(
+                    messages=compress_request,
+                    tool_schemas=[],
+                    bus=silent_bus,
+                    run_id="compact",
+                    step=0,
+                    system="You are a helpful assistant that summarizes conversations.",
+                )
         except Exception:
             logger.exception("compactor: LLM call failed, skipping compaction")
             return None
 
         summary_text = response.text.strip()
-        if not summary_text:
-            logger.warning("compactor: LLM returned empty summary, skipping compaction")
+        if response.stop_reason != "end_turn" or not summary_text:
+            logger.warning("compactor: summary empty or incomplete, skipping compaction")
             return None
 
         summary_tokens = response.usage.output_tokens if response.usage else len(summary_text) // 4
@@ -150,14 +168,10 @@ class Compactor:
             summary_tokens=summary_tokens,
         )
 
-    # 将摘要文本写入 session 目录的 summary_<ts>.md
+    # 将摘要完整写入 session 目录，原子提交失败向调用者传播以保留旧上下文
     def _write_summary(self, text: str) -> None:
-        try:
-            self._session_dir.mkdir(parents=True, exist_ok=True)
-            path = self._session_dir / f"summary_{_ts_compact()}.md"
-            path.write_text(text, encoding="utf-8")
-        except Exception:
-            logger.exception("compactor: failed to write summary file")
+        path = self._session_dir / f"summary_{_ts_compact()}.md"
+        atomic_write_bytes(path, text.encode("utf-8"))
 
 
 # 将消息列表序列化为可供 LLM 阅读的纯文本

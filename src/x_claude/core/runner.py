@@ -220,7 +220,7 @@ class AgentRunner:
                     if session is not None and store is not None
                     else run_path
                 )
-                compactor = Compactor(bus, session_dir, session_id_str)
+                compactor = Compactor(bus, session_dir, session_id_str, store=store)
                 loop = AgentLoop(
                     provider, registry, bus,
                     permission_manager=self._permission_manager,
@@ -251,9 +251,9 @@ class AgentRunner:
             )
 
         if session is not None and store is not None:
-            # 压缩会替换消息列表，此时完整保存摘要与后续消息，避免按旧历史长度切片而丢失续接内容
+            # 压缩提交时已持久化两条摘要消息，此处只追加最后一次压缩后新生成的消息
             if context.messages is not initial_messages:
-                store.write_compacted(session.id, context.messages)
+                store.append_messages(session.id, context.messages[2:], run_id=run_id)
             else:
                 store.append_messages(session.id, context.messages[prefill_len:], run_id=run_id)
 

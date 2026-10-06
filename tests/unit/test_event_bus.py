@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import pytest
 from pydantic import BaseModel
 
 from x_claude.core.events.bus import EventBus
@@ -7,6 +8,33 @@ from x_claude.core.events.bus import EventBus
 
 class _FakeEvent(BaseModel):
     value: str
+
+
+# 功能：验证事件异常隔离仅在显式启用时生效，默认发布仍传播订阅者异常
+# 设计：同一故障订阅者分别运行两种模式，检查后续订阅者是否收到事件，保护现有总线语义
+@pytest.mark.parametrize("isolate_errors", [False, True])
+async def test_subscriber_error_isolation_is_opt_in(isolate_errors: bool) -> None:
+    bus = EventBus()
+    received: list[BaseModel] = []
+
+    # 模拟观察者故障
+    async def fail(event: BaseModel) -> None:
+        raise RuntimeError("subscriber failure")
+
+    # 收集后续观察者事件
+    async def collect(event: BaseModel) -> None:
+        received.append(event)
+
+    bus.subscribe(fail)
+    bus.subscribe(collect)
+    event = _FakeEvent(value="hello")
+    if isolate_errors:
+        await bus.publish(event, isolate_errors=True)
+        assert received == [event]
+    else:
+        with pytest.raises(RuntimeError):
+            await bus.publish(event)
+        assert not received
 
 
 # 功能：验证 publish 后订阅者能收到事件对象
