@@ -60,6 +60,15 @@ cp .env.example .env
 | `X_LOG_LEVEL` | `INFO` | 日志级别（DEBUG / INFO / WARNING / ERROR） |
 | `X_LOG_FILE` | `~/.x/logs/core.log` | 日志文件路径（留空则仅输出 stderr） |
 | `X_LOG_FORMAT` | `text` | 日志格式（`text` 或 `json`） |
+| `X_COMPACT_THRESHOLD` | `0.8` | 自动摘要压缩阈值，范围 0–1；设为 0 禁用 |
+
+自动压缩默认开启：在工具调用步骤结束、任务仍需继续且 `context_pct >= 0.8` 时触发。
+压缩成功后以摘要和助手确认消息替换历史，保存摘要文件，并备份原会话历史；后续对话从压缩后的上下文续接。
+压缩失败或摘要为空时保留原上下文，继续执行。`/compact` 手动压缩仍然可用。
+
+`context_pct` 当前使用最近一次模型响应的 `input_tokens / context_window`，尚未计入缓存 token
+和本步新追加的工具结果；压缩不会额外保留最新 1–2 轮原始消息。
+修改配置后需重启 `x-core` 生效。
 
 ---
 

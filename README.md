@@ -405,7 +405,7 @@ TUI 手动触发：
 
 ```toml
 [compaction]
-auto_threshold = 0.0
+auto_threshold = 0.8
 tool_result_limit = 8000
 tool_result_keep = 4000
 ```
@@ -413,10 +413,13 @@ tool_result_keep = 4000
 其中：
 
 ```text
-auto_threshold = 0.0
+auto_threshold = 0.8
 ```
 
-表示默认关闭自动压缩，可以通过 `/compact` 手动触发。
+表示默认在工具调用步骤结束、任务仍需继续且上下文占用比例达到 80% 时自动压缩。
+压缩成功后用摘要和助手确认消息替换历史，并保存压缩后的会话供后续对话续接；原历史会备份。
+压缩失败时保留原上下文。设为 `0.0` 可关闭自动压缩，也可以通过 `/compact` 手动触发。
+环境变量 `X_COMPACT_THRESHOLD` 可覆盖阈值，修改配置后需重启 `x-core`。
 
 ---
 
@@ -732,7 +735,7 @@ include_llm_payload = true
 timeout_s = 60
 
 [compaction]
-auto_threshold = 0.0
+auto_threshold = 0.8
 tool_result_limit = 8000
 tool_result_keep = 4000
 ```

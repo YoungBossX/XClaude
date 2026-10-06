@@ -181,6 +181,7 @@ class AgentRunner:
             system_prompt_override=system_prompt_override,
         )
         prefill_len = len(history)
+        initial_messages = context.messages
 
         async with EventWriter(run_path / "events.jsonl") as writer:
             writer.subscribe(bus)
@@ -250,7 +251,11 @@ class AgentRunner:
             )
 
         if session is not None and store is not None:
-            store.append_messages(session.id, context.messages[prefill_len:], run_id=run_id)
+            # 压缩会替换消息列表，此时完整保存摘要与后续消息，避免按旧历史长度切片而丢失续接内容
+            if context.messages is not initial_messages:
+                store.write_compacted(session.id, context.messages)
+            else:
+                store.append_messages(session.id, context.messages[prefill_len:], run_id=run_id)
 
         if cancelled:
             raise asyncio.CancelledError()

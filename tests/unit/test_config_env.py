@@ -4,11 +4,30 @@ from pathlib import Path
 
 import pytest
 
-from x_claude.core.config import get_config
+from x_claude.core.config import XConfig, get_config
 
 
 def _write_env(path: Path, content: str) -> None:
     path.write_text(content, encoding="utf-8")
+
+
+# 功能：验证内建配置默认开启 80% 阈值的自动压缩
+# 设计：直接构造配置，避免用户本地 TOML 和环境变量影响默认行为验证
+def test_auto_compaction_enabled_by_default() -> None:
+    assert XConfig().compaction.auto_threshold == 0.8
+
+
+# 功能：验证 .env 仍可调整自动压缩阈值或显式禁用
+# 设计：隔离配置路径并清除系统同名变量，覆盖禁用、默认和自定义阈值三种使用方式
+@pytest.mark.parametrize("threshold", [0.0, 0.8, 0.9])
+def test_dotenv_compaction_threshold_override(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, threshold: float,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("X_CONFIG", str(tmp_path / "absent.toml"))
+    monkeypatch.delenv("X_COMPACT_THRESHOLD", raising=False)
+    _write_env(tmp_path / ".env", f"X_COMPACT_THRESHOLD={threshold}\n")
+    assert get_config().compaction.auto_threshold == threshold
 
 
 # 功能：验证 .env 文件中的值被正确加载并覆盖内建默认值

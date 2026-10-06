@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from unittest.mock import AsyncMock
 
+import pytest
 from pydantic import BaseModel
 
 from x_claude.core.config import XConfig
 from x_claude.core.events.bus import EventBus
-from x_claude.core.llm.types import LlmResponse, ToolCallBlock
+from x_claude.core.llm.types import LlmResponse, ToolCallBlock, UsageStats
 from x_claude.core.runner import AgentRunner
 
 # --- mock provider -----------------------------------------------------------
@@ -106,6 +108,92 @@ async def _run(
 
 
 # --- tests -------------------------------------------------------------------
+
+
+# 功能：验证默认自动压缩的触发边界、终止保护、失败降级及会话续接持久化
+# 设计：使用真实 runner 和压缩器配合受控响应，检查磁盘历史、备份和下一轮入参，全程不调用外部 API
+@pytest.mark.parametrize(
+    ("context_pct", "threshold", "max_steps", "summary", "should_compact"),
+    [
+        (0.79, 0.8, 5, "handoff summary", False),
+        (0.8, 0.8, 5, "handoff summary", True),
+        (0.9, 0.8, 5, "handoff summary", True),
+        (0.9, 0.0, 5, "handoff summary", False),
+        (0.9, 0.8, 1, "handoff summary", False),
+        (0.9, 0.8, 5, "", False),
+        (0.9, 0.8, 5, None, False),
+    ],
+)
+async def test_auto_compaction_preserves_session_continuation(
+    tmp_path: Path, context_pct: float, threshold: float, max_steps: int,
+    summary: str | None, should_compact: bool,
+) -> None:
+    from x_claude.core.session.model import Session
+    from x_claude.core.session.store import SessionStore
+
+    store = SessionStore(tmp_path / "sessions")
+    session = Session(
+        id="sess-compact", mode="chat", status="active", title="",
+        created_at="t", updated_at="t",
+    )
+    store.write_meta(session)
+    store.append_message(session.id, "user", "old question")
+    store.append_message(session.id, "assistant", "old answer")
+    store.append_message(session.id, "user", "continue task")
+    store.append_note(session.id, "durable note", "old-run")
+    initial_history = store.read_messages(session.id)
+    captured: list[list[dict[str, object]]] = []
+    compaction_calls: list[str] = []
+
+    # 按调用阶段返回工具响应、摘要和最终答复，并捕获压缩后继续执行的入参
+    async def chat(
+        messages: list[dict[str, object]], tool_schemas: list[dict[str, object]],
+        bus: EventBus, run_id: str, *, step: int = 0, system: str | None = None,
+    ) -> LlmResponse:
+        if run_id == "compact":
+            compaction_calls.append(run_id)
+            assert not tool_schemas
+            assert "tool_result" in str(messages)
+            if summary is None:
+                raise RuntimeError("summary service unavailable")
+            return LlmResponse(stop_reason="end_turn", text=summary)
+        captured.append([dict(message) for message in messages])
+        if step == 1:
+            return LlmResponse(
+                stop_reason="tool_use",
+                tool_calls=[ToolCallBlock(id="tool-1", name="unknown_tool", input={})],
+                usage=UsageStats(input_tokens=160_000, output_tokens=20, context_pct=context_pct),
+            )
+        return LlmResponse(stop_reason="end_turn", text="final answer")
+
+    provider = _CapturingProvider(LlmResponse(stop_reason="end_turn"))
+    provider.chat = AsyncMock(side_effect=chat)  # type: ignore[method-assign]
+    config = _config(max_steps=max_steps)
+    config.compaction.auto_threshold = threshold
+    runner = AgentRunner(config, provider=provider, runs_dir=tmp_path / "runs")
+    outcome = await runner.run_and_capture(
+        "continue task", run_id="run-compact", session=session, store=store,
+    )
+
+    persisted = store.read_messages(session.id)
+    assert outcome.status == ("failed" if max_steps == 1 else "success")
+    assert "durable note" in store.read_notes(session.id)
+    if should_compact:
+        assert len(compaction_calls) == 1
+        assert captured[1][0] == {"role": "user", "content": summary}
+        assert persisted[:2] == captured[1]
+        assert persisted[-1]["content"] == [{"type": "text", "text": "final answer"}]
+        assert len(list(store.session_dir(session.id).glob("thread_*.jsonl.bak"))) == 1
+    else:
+        assert persisted[:3] == initial_history
+        assert not list(store.session_dir(session.id).glob("thread_*.jsonl.bak"))
+
+    followup_provider = _CapturingProvider(LlmResponse(stop_reason="end_turn", text="resumed"))
+    followup_runner = AgentRunner(config, provider=followup_provider, runs_dir=tmp_path / "runs")
+    await followup_runner.run_and_capture(
+        "follow up", run_id="run-followup", session=session, store=store,
+    )
+    assert followup_provider.messages == persisted
 
 
 # 功能：验证 run 开始时发布携带正确 goal 的 run.started 事件
