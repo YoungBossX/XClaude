@@ -5,6 +5,7 @@ import logging
 import uuid
 from collections.abc import Callable
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from x_claude.core.bus.envelope import HandlerError
@@ -14,6 +15,7 @@ from x_claude.core.bus.events import (
     SessionCreatedEvent,
     SessionMessageReceivedEvent,
     SessionResumedEvent,
+    SessionSynchronizedEvent,
     SessionWaitingForInputEvent,
     SkillInvokedEvent,
 )
@@ -83,6 +85,27 @@ class SessionManager:
         self._store.write_meta(session)
         await self._bus.publish(SessionCreatedEvent(session_id=sid, mode=mode, ts=ts))
         return session
+
+    # 获取当前会话的事件日志路径，订阅回放不得越过会话存储范围
+    def event_paths(self, sid: str) -> list[Path]:
+        self._get_session(sid)
+        return sorted(self._store.runs_dir(sid).glob("*/events.jsonl"))
+
+    # 从实际会话存储查找指定运行的日志，精确匹配目录名而不解释用户输入为路径或通配符
+    def run_event_path(self, run_id: str) -> Path | None:
+        return next((path for path in self._store.root.glob("*/runs/*/events.jsonl")
+                     if path.parent.name == run_id), None)
+
+    # 同步当前状态，包含尚未取得会话锁但已登记的主任务续跑协程
+    def synchronization_event(self, sid: str) -> SessionSynchronizedEvent:
+        session = self._get_session(sid)
+        root = self._root_tasks.get(sid)
+        active = self._active_by_session.get(sid)
+        busy = (active is not None and not active.done() and session.status == "active")
+        busy = busy or (root is not None and not root.done() and root is not active)
+        return SessionSynchronizedEvent(
+            session_id=sid, status=session.status, busy=busy, ts=_now(),
+        )
 
     # 恢复磁盘中最近更新的 chat session，使其重新接受用户消息
     async def continue_latest(self) -> Session:

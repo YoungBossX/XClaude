@@ -246,7 +246,7 @@ def test_tool_call_started_and_finished() -> None:
         "params": {"command": "echo hi"},
         "run_id": "r", "ts": "t",
     })
-    assert "uid-1" in app._pending_tool_blocks  # type: ignore[attr-defined]
+    assert ("r", "uid-1") in app._pending_tool_blocks  # type: ignore[attr-defined]
 
     app._handle_event({
         "type": "tool.call_finished",
@@ -256,7 +256,7 @@ def test_tool_call_started_and_finished() -> None:
         "output": "hi",
         "run_id": "r", "ts": "t",
     })
-    assert "uid-1" not in app._pending_tool_blocks  # type: ignore[attr-defined]
+    assert ("r", "uid-1") not in app._pending_tool_blocks  # type: ignore[attr-defined]
     block = appended[0]
     assert isinstance(block, ToolCallBlock)
     assert block._finished  # type: ignore[attr-defined]

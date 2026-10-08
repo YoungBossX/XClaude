@@ -26,6 +26,11 @@ class SessionStore:
         self._root = root.expanduser()
         self._root.mkdir(parents=True, exist_ok=True)
 
+    # 返回会话存储的实际目录，供 daemon 取得跨进程写入互斥锁
+    @property
+    def root(self) -> Path:
+        return self._root.resolve()
+
     # 返回指定 session 的目录路径
     def session_dir(self, sid: str) -> Path:
         return self._root / sid

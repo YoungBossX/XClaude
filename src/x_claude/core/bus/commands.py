@@ -32,6 +32,7 @@ class EventSubscribeCommand(BaseModel):
     topics: list[str]          # fnmatch 模式，如 ["step.*", "tool.*"]
     scope: str = "global"      # "global" | "run:<run_id>" | "session:<session_id>"
     replay_from_run: str | None = None  # 设置则先从 events.jsonl 回放历史再接实时流
+    replay_session: bool = False  # 仅 session scope 可补全该会话所有运行的事件
 
 
 class EventSubscribeResult(BaseModel):

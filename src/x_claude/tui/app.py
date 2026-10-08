@@ -6,9 +6,10 @@ import logging
 import time
 from typing import Any
 
-log = logging.getLogger(__name__)
-
+from rich.console import Group
 from rich.markdown import Markdown
+from rich.markup import escape
+from rich.text import Text
 from textual import events
 from textual.app import App, ComposeResult
 from textual.binding import Binding
@@ -21,6 +22,8 @@ from textual.widgets import Label, Static, TextArea
 from x_claude.core.config import XConfig
 from x_claude.core.skills.loader import SkillLoader
 from x_claude.core.transport.socket_client import IpcError, SocketClient
+
+log = logging.getLogger(__name__)
 
 
 def _preview(s: str, n: int) -> str:
@@ -55,17 +58,18 @@ class LLMStreamBlock(Static):
     DEFAULT_CSS = "LLMStreamBlock { padding: 0 2; color: $text; }"
 
     # 初始化为空文本块
-    def __init__(self) -> None:
+    def __init__(self, label: str = "") -> None:
         super().__init__("")
         self._text = ""
         self._finalized = False
+        self._label = label
 
     # 追加一个 token 并刷新显示
     def append_token(self, token: str) -> None:
         if self._finalized:
             return
         self._text += token
-        self.update(self._text)
+        self.update(Text(f"Agent {self._label}\n{self._text}") if self._label else self._text)
 
     # 将累积文本渲染为 Markdown，供流式块结束后显示
     def finalize_markdown(self) -> None:
@@ -73,7 +77,9 @@ class LLMStreamBlock(Static):
             return
         self._finalized = True
         if self._text.strip():
-            self.update(Markdown(self._text, code_theme="monokai"))
+            rendered = Markdown(self._text, code_theme="monokai")
+            self.update(Group(Text(f"Agent {self._label}", style="dim"), rendered)
+                        if self._label else rendered)
 
 
 class ToolCallBlock(Widget):
@@ -87,7 +93,7 @@ class ToolCallBlock(Widget):
     """
 
     # 初始化工具调用信息
-    def __init__(self, tool_name: str, params: dict[str, Any]) -> None:
+    def __init__(self, tool_name: str, params: dict[str, Any], *, agent_label: str = "") -> None:
         super().__init__()
         self._tool_name = tool_name
         self._params = params
@@ -96,6 +102,7 @@ class ToolCallBlock(Widget):
         self._elapsed_ms = 0
         self._is_error = False
         self._finished = False
+        self._agent_label = agent_label
 
     def compose(self) -> ComposeResult:
         yield Static(self._summary(), classes="summary")
@@ -108,6 +115,8 @@ class ToolCallBlock(Widget):
 
         params_pre = _param_summary(self._tool_name, self._params)
         line = f"  [dim]tool[/dim] [bold]{self._tool_name}[/bold]"
+        if self._agent_label:
+            line += f"  [dim]({escape(self._agent_label)})[/dim]"
         if params_pre:
             line += f"  [dim]{params_pre}[/dim]"
         if self._finished:
@@ -206,7 +215,8 @@ class PermissionSelect(Static):
 
     # 焦点到达时记录，用于确认 focus() 是否真正生效
     def on_focus(self, event: events.Focus) -> None:
-        log.debug("PermissionSelect.on_focus  has_focus=%s  app.focused=%r", self.has_focus, self.app.focused)
+        log.debug("PermissionSelect.on_focus  has_focus=%s  app.focused=%r",
+                  self.has_focus, self.app.focused)
 
     # 焦点离开时记录，用于追踪是否被其他控件抢走焦点
     def on_blur(self, event: events.Blur) -> None:
@@ -521,8 +531,9 @@ class XTuiApp(App[None]):
         self._continue_session = continue_session
         self._resume_session_id = resume_session_id
         self._client: SocketClient | None = None
-        self._current_llm: LLMStreamBlock | None = None
-        self._pending_tool_blocks: dict[str, ToolCallBlock] = {}
+        self._llm_streams: dict[str, LLMStreamBlock] = {}
+        self._seen_event_ids: set[str] = set()
+        self._pending_tool_blocks: dict[tuple[str, str], ToolCallBlock] = {}
         self._pending_permission_blocks: dict[tuple[str, str], PermissionBlock] = {}
         self._session_id: str | None = None
         self._busy = False
@@ -758,6 +769,11 @@ class XTuiApp(App[None]):
             return
         self._session_id = str(result["session_id"])
         self._resume_session_id = self._session_id
+        self._seen_event_ids.clear()
+        self._pending_tool_blocks.clear()
+        self._discard_permission_prompts()
+        self._subagent_run_ids.clear()
+        self._subagent_start_times.clear()
         await self._subscribe_session()
         self._break_llm()
         log_view = self.query_one("#log-view", VerticalScroll)
@@ -826,11 +842,21 @@ class XTuiApp(App[None]):
         log_view.mount(widget)
         log_view.scroll_end(animate=False)
 
-    # 结束当前 LLM 流式块（下一个 token 将开启新块）
-    def _break_llm(self) -> None:
-        if self._current_llm is not None:
-            self._current_llm.finalize_markdown()
-        self._current_llm = None
+    # 仅结束对应运行的流式块；清空会话时结束所有运行，避免相互截断或拼接
+    def _break_llm(self, run_id: str | None = None) -> None:
+        keys = list(self._llm_streams) if run_id is None else [run_id]
+        for key in keys:
+            block = self._llm_streams.pop(key, None)
+            if block is not None:
+                block.finalize_markdown()
+
+    # 断线后移除失去连接授权的审批控件，重连只挂载服务器确认仍挂起的请求
+    def _discard_permission_prompts(self) -> None:
+        for block in self._pending_permission_blocks.values():
+            block.remove()
+        self._pending_permission_blocks.clear()
+        for select in self.query(PermissionSelect):
+            select.remove()
 
     # 将选择控件挂载到 Screen 顶层（#prompt 之前），避免 VerticalScroll 争抢焦点
     def _mount_permission_select(self, select: PermissionSelect) -> None:
@@ -882,6 +908,7 @@ class XTuiApp(App[None]):
             "topics": ["session.*", "run.*", "step.*", "tool.*", "llm.*", "log.*",
                        "permission.*", "context.*", "subagent.*", "skill.*"],
             "scope": f"session:{self._session_id}",
+            "replay_session": self._replay_run_id is None,
         }
         if self._replay_run_id is not None:
             params["scope"] = f"run:{self._replay_run_id}"
@@ -938,7 +965,7 @@ class XTuiApp(App[None]):
                 await self._subscribe_session()
                 prompt = self._prompt()
                 if prompt is not None:
-                    prompt.disabled = self._busy
+                    prompt.disabled = self._busy or bool(self._pending_permission_blocks)
                     prompt.read_only = False
                     prompt.border_title = "type a message — enter to send, ⌘/⇧/⌥+enter for newline"
                     prompt.focus()
@@ -956,7 +983,7 @@ class XTuiApp(App[None]):
                     prompt.disabled = True
                     prompt.read_only = False
                     prompt.border_title = "disconnected, retrying..."
-                self._break_llm()
+                self._discard_permission_prompts()
                 await client.close()
 
             self._update_header("disconnected")
@@ -967,8 +994,13 @@ class XTuiApp(App[None]):
         if (self._replay_run_id is None and self._session_id is not None
                 and event.get("session_id") not in (None, "", self._session_id)):
             return
+        event_id = str(event.get("event_id", ""))
+        if event_id and event_id in self._seen_event_ids:
+            return
         try:
             self._handle_event_inner(event)
+            if event_id:
+                self._seen_event_ids.add(event_id)
         except Exception:
             log.exception("_handle_event crashed  event_type=%s", event.get("type", "?"))
 
@@ -978,16 +1010,34 @@ class XTuiApp(App[None]):
 
         if t == "llm.token":
             token = event.get("token", "")
-            if self._current_llm is None:
-                llm_block = LLMStreamBlock()
+            run_id = str(event.get("run_id", ""))
+            if run_id not in self._llm_streams:
+                label = f"{self._subagent_run_ids.get(run_id, 'main')} · {run_id}" if run_id else ""
+                llm_block = LLMStreamBlock(label)
+                if run_id in self._subagent_run_ids:
+                    llm_block.styles.padding = (0, 2, 0, 6)
                 self._append(llm_block)
-                self._current_llm = llm_block
-            self._current_llm.append_token(token)
+                self._llm_streams[run_id] = llm_block
+            self._llm_streams[run_id].append_token(token)
             return
 
-        self._break_llm()
+        # 重连状态通知不表示模型流结束，必须保留已收到的前缀供后续 token 续接
+        if "run_id" in event and t in {
+            "step.started", "step.finished", "run.started", "run.finished",
+            "tool.call_started", "llm.usage", "llm.model_selected", "subagent.finished",
+        }:
+            self._break_llm(str(event["run_id"]))
 
-        if t == "session.waiting_for_input":
+        if t == "session.synchronized":
+            self._busy = bool(event.get("busy"))
+            prompt = self._prompt()
+            closed = event.get("status") == "closed"
+            if prompt is not None:
+                prompt.disabled = closed or self._busy or bool(self._pending_permission_blocks)
+                prompt.read_only = False
+            self._update_header("disconnected" if closed else "running" if self._busy else "ready")
+
+        elif t == "session.waiting_for_input":
             self._busy = False
             prompt = self._prompt()
             if prompt is not None:
@@ -1099,26 +1149,30 @@ class XTuiApp(App[None]):
             tool_name = str(event.get("tool_name", ""))
             params = event.get("params") or {}
             run_id = event.get("run_id", "")
-            tc_block = ToolCallBlock(tool_name, params)
+            label = (f"{self._subagent_run_ids.get(str(run_id), 'main')} · {str(run_id)[-6:]}"
+                     if run_id else "")
+            tc_block = ToolCallBlock(tool_name, params, agent_label=label)
             if run_id in self._subagent_run_ids:
                 tc_block.styles.padding = (0, 2, 0, 6)
-            self._pending_tool_blocks[tool_use_id] = tc_block
+            self._pending_tool_blocks[(str(run_id), tool_use_id)] = tc_block
             self._append(tc_block)
 
         elif t == "tool.call_finished":
             tool_use_id = str(event.get("tool_use_id", ""))
+            key = (str(event.get("run_id", "")), tool_use_id)
             elapsed_ms = int(event.get("elapsed_ms") or 0)
             output = str(event.get("output") or "")
-            if tool_use_id in self._pending_tool_blocks:
-                tc_done = self._pending_tool_blocks.pop(tool_use_id)
+            if key in self._pending_tool_blocks:
+                tc_done = self._pending_tool_blocks.pop(key)
                 tc_done.set_result(output, elapsed_ms)
 
         elif t == "tool.call_failed":
             tool_use_id = str(event.get("tool_use_id", ""))
+            key = (str(event.get("run_id", "")), tool_use_id)
             elapsed_ms = int(event.get("elapsed_ms") or 0)
             error_msg = str(event.get("error_message") or "")
-            if tool_use_id in self._pending_tool_blocks:
-                tc_done = self._pending_tool_blocks.pop(tool_use_id)
+            if key in self._pending_tool_blocks:
+                tc_done = self._pending_tool_blocks.pop(key)
                 tc_done.set_result(error_msg, elapsed_ms, is_error=True)
 
         elif t == "run.finished":
@@ -1199,10 +1253,11 @@ class XTuiApp(App[None]):
             self._append(perm_block)
             select = PermissionSelect(tool_use_id, run_id=run_id)
             self._mount_permission_select(select)
-            log.debug("PermissionSelect mounted before #prompt  pending=%d", len(self._pending_permission_blocks))
+            log.debug("PermissionSelect mounted before #prompt  pending=%d",
+                      len(self._pending_permission_blocks))
 
         elif t in ("permission.denied", "permission.granted"):
-            # 处理超时或断连等非用户交互触发的 deny（用户主动 deny 已由 on_permission_select_decided 处理）
+            # 处理超时或断连的审批结算，用户主动决策由 on_permission_select_decided 处理
             tool_use_id = str(event.get("tool_use_id", ""))
             key = (str(event.get("run_id", "")), tool_use_id)
             decision = str(event.get("decision", "denied"))

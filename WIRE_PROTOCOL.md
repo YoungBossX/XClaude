@@ -247,6 +247,7 @@ All commands are sent as authenticated JSON-RPC 2.0 requests. `method` selects t
 | `topics` | `array` | yes |
 | `scope` | `string` | no |
 | `replay_from_run` | `string | null` | no |
+| `replay_session` | `boolean` | no |
 
 ```json
 {
@@ -280,6 +281,11 @@ All commands are sent as authenticated JSON-RPC 2.0 requests. `method` selects t
       ],
       "default": null,
       "title": "Replay From Run"
+    },
+    "replay_session": {
+      "default": false,
+      "title": "Replay Session",
+      "type": "boolean"
     }
   },
   "required": [
@@ -2099,6 +2105,63 @@ Events written to `runs/<run_id>/events.jsonl` and forwarded over IPC to subscri
   "type": "session.closed",
   "session_id": "sess-abc123def456",
   "ts": "2026-05-16T10:00:00.001Z"
+}
+```
+
+### SessionSynchronizedEvent
+
+| Field | Type | Required |
+|---|---|---|
+| `event_id` | `string` | no |
+| `type` | `string` | no |
+| `session_id` | `string` | yes |
+| `status` | `string` | yes |
+| `busy` | `boolean` | yes |
+| `ts` | `string` | yes |
+
+```json
+{
+  "properties": {
+    "event_id": {
+      "title": "Event Id",
+      "type": "string"
+    },
+    "type": {
+      "const": "session.synchronized",
+      "default": "session.synchronized",
+      "title": "Type",
+      "type": "string"
+    },
+    "session_id": {
+      "title": "Session Id",
+      "type": "string"
+    },
+    "status": {
+      "enum": [
+        "active",
+        "waiting_for_input",
+        "closed"
+      ],
+      "title": "Status",
+      "type": "string"
+    },
+    "busy": {
+      "title": "Busy",
+      "type": "boolean"
+    },
+    "ts": {
+      "title": "Ts",
+      "type": "string"
+    }
+  },
+  "required": [
+    "session_id",
+    "status",
+    "busy",
+    "ts"
+  ],
+  "title": "SessionSynchronizedEvent",
+  "type": "object"
 }
 ```
 

@@ -3,10 +3,13 @@ from __future__ import annotations
 import asyncio
 import datetime
 import fnmatch
+import heapq
 import json
 import logging
 import signal
 import time
+from collections.abc import Generator
+from contextlib import AsyncExitStack
 from datetime import UTC
 from pathlib import Path
 from typing import Any
@@ -41,7 +44,7 @@ from x_claude.core.bus.commands import (
     SessionSendMessageCommand,
     SessionSendMessageResult,
 )
-from x_claude.core.bus.envelope import EventPushEnvelope
+from x_claude.core.bus.envelope import INVALID_PARAMS, EventPushEnvelope, HandlerError
 from x_claude.core.config import XConfig, get_config
 from x_claude.core.events.bus import EventBus
 from x_claude.core.llm.provider import AnthropicProvider
@@ -52,6 +55,7 @@ from x_claude.core.permissions.storage import load_policy_file
 from x_claude.core.runner import AgentRunner
 from x_claude.core.runs import events_file, new_run_id
 from x_claude.core.session import SessionManager, SessionStore
+from x_claude.core.session.lock import SessionStoreLock, StoreInUseError
 from x_claude.core.trace.record import TraceRecord
 from x_claude.core.trace.writer import TraceWriter
 from x_claude.core.transport.ipc_broadcaster import IpcEventBroadcaster
@@ -214,14 +218,25 @@ class CoreApp:
         cmd = EventSubscribeCommand.model_validate(params)
         writer = get_connection_writer()
 
+        if cmd.replay_session and (not cmd.scope.startswith("session:")
+                                   or cmd.replay_from_run is not None):
+            raise HandlerError(INVALID_PARAMS, "replay_session requires session scope only")
+
         assert self._broadcaster is not None
         replayed_count = 0
         sub_id = self._broadcaster.subscribe(
-            writer, cmd.topics, cmd.scope, replaying=cmd.replay_from_run is not None,
+            writer, cmd.topics, cmd.scope,
+            replaying=cmd.replay_from_run is not None or cmd.replay_session,
         )
         try:
-            if cmd.replay_from_run is not None:
+            if cmd.replay_session:
                 replayed_ids: set[str] = set()
+                replayed_count = await self._replay_session_events(
+                    cmd.scope[8:], writer, cmd.topics, replayed_ids,
+                )
+                await self._broadcaster.finish_replay(writer, replayed_ids)
+            elif cmd.replay_from_run is not None:
+                replayed_ids = set()
                 replayed_count = await self._replay_events(
                     cmd.replay_from_run, writer, cmd.topics, scope=cmd.scope,
                     replayed_ids=replayed_ids,
@@ -229,13 +244,69 @@ class CoreApp:
                 await self._broadcaster.finish_replay(writer, replayed_ids)
             if self._permission_manager is not None:
                 for event in self._permission_manager.pending_events():
+                    # 上一个补发的 drain 期间审批可能已超时或被其他连接处理，不能发送失效快照
+                    if event not in self._permission_manager.pending_events():
+                        continue
                     await self._broadcaster.send_pending_permission(writer, event)
+            if cmd.scope.startswith("session:") and self._sessions is not None:
+                sid = cmd.scope[8:]
+                await self._sessions.recover_background(sid)
+                if any(fnmatch.fnmatch("session.synchronized", p) for p in cmd.topics):
+                    state = self._sessions.synchronization_event(sid)
+                    writer.write(EventPushEnvelope(event=state.model_dump()).model_dump_json()
+                                 .encode() + b"\n")
+                    await asyncio.wait_for(writer.drain(), timeout=2.0)
         except BaseException:
             self._broadcaster.unsubscribe(writer)
             raise
-        if cmd.scope.startswith("session:") and self._sessions is not None:
-            await self._sessions.recover_background(cmd.scope[8:])
         return EventSubscribeResult(subscription_id=sub_id, replayed_count=replayed_count)
+
+    # 按时间合并会话日志，去重父子日志的镜像事件，实时事件在回放期间暂存
+    async def _replay_session_events(
+        self, sid: str, writer: asyncio.StreamWriter, topics: list[str], seen: set[str],
+    ) -> int:
+        assert self._sessions is not None and self._broadcaster is not None
+
+        # 只读取订阅开始时已落盘的完整行，不把后续写入混入回放快照
+        def read_events(path: Path, size: int) -> Generator[dict[str, Any], None, None]:
+            with path.open("rb") as stream:
+                while stream.tell() < size:
+                    line = stream.readline(size - stream.tell())
+                    if not line.endswith(b"\n"):
+                        break
+                    try:
+                        item = json.loads(line)
+                    except (ValueError, UnicodeError):
+                        continue
+                    if isinstance(item, dict):
+                        yield {**item, "session_id": sid}
+
+        paths = self._sessions.event_paths(sid)
+        streams = [read_events(path, path.stat().st_size) for path in paths]
+        count = 0
+        try:
+            for raw in heapq.merge(*streams, key=lambda item: str(item.get("ts", ""))):
+                event = self._broadcaster.associate(raw)
+                identity = str(event.get("event_id", ""))
+                if identity and identity in seen:
+                    continue
+                if identity:
+                    seen.add(identity)
+                # 历史审批只作为日志，不能重新挂载可操作弹窗；真实待审批稍后单独补发
+                if event.get("type") == "permission.requested":
+                    continue
+                if not any(fnmatch.fnmatch(event.get("type", ""), p) for p in topics):
+                    continue
+                writer.write(EventPushEnvelope(event=event).model_dump_json().encode() + b"\n")
+                count += 1
+                if count % 100 == 0:
+                    await asyncio.wait_for(writer.drain(), timeout=2.0)
+        finally:
+            for stream in streams:
+                stream.close()
+        if count:
+            await asyncio.wait_for(writer.drain(), timeout=2.0)
+        return count
 
     # 从 events.jsonl 向 writer 回放匹配 topic 的历史事件，返回已回放条数
     async def _replay_events(
@@ -247,11 +318,10 @@ class CoreApp:
     ) -> int:
         path = events_file(run_id)
         if not path.exists():
-            for candidate in Path("~/.x/sessions").expanduser().glob(
-                f"*/runs/{run_id}/events.jsonl"
-            ):
+            candidate = (self._sessions.run_event_path(run_id)
+                         if self._sessions is not None else None)
+            if candidate is not None:
                 path = candidate
-                break
         if not path.exists():
             return 0
 
@@ -287,96 +357,91 @@ class CoreApp:
     async def run(self) -> None:
         self._start_time = time.monotonic()
         self._config = get_config()
-        setup_logging(self._config)
+        store = SessionStore(Path("~/.x/sessions").expanduser())
+        try:
+            with SessionStoreLock(store.root):
+                await self._run_locked(store)
+        except StoreInUseError as exc:
+            raise SystemExit(str(exc)) from None
 
-        if self._config.trace.enabled:
-            trace_path = Path(self._config.trace.file).expanduser()
-            self._trace = TraceWriter(trace_path)
-            await self._trace.start()
-            self._bus.subscribe(self._trace_event_handler)
-
-        policy_file = Path("~/.x/policy.toml").expanduser()
-        self._permission_manager = PermissionManager(
-            policy_file=policy_file,
-            timeout_s=self._config.permission.timeout_s,
-        )
-        logger.info(
-            "permission manager: timeout_s=%.1f  persistent=%d entries",
-            self._config.permission.timeout_s,
-            len(load_policy_file(policy_file)),
-        )
-
-        self._broadcaster = IpcEventBroadcaster(trace=self._trace)
-        self._bus.subscribe(self._broadcaster.handle)
-        sessions_root = Path("~/.x/sessions").expanduser()
-        store = SessionStore(sessions_root)
+    # 持有存储锁期间启动资源，退出或启动失败时按依赖顺序完整关闭后才释放锁
+    async def _run_locked(self, store: SessionStore) -> None:
         assert self._config is not None
-        compact_provider = AnthropicProvider(
-            self._config.llm.default_model, context_window=self._config.llm.context_window,
-        )
+        setup_logging(self._config)
+        async with AsyncExitStack() as cleanup:
+            if self._config.trace.enabled:
+                trace_path = Path(self._config.trace.file).expanduser()
+                self._trace = TraceWriter(trace_path)
+                cleanup.push_async_callback(self._trace.stop)
+                await self._trace.start()
+                self._bus.subscribe(self._trace_event_handler)
 
-        self._mcp_manager = McpServerManager()
-        if self._config.mcp.servers:
-            logger.info("mcp: starting %d server(s)", len(self._config.mcp.servers))
-            await self._mcp_manager.start_all(self._config.mcp.servers)
+            policy_file = Path("~/.x/policy.toml").expanduser()
+            self._permission_manager = PermissionManager(
+                policy_file=policy_file, timeout_s=self._config.permission.timeout_s,
+            )
+            logger.info(
+                "permission manager: timeout_s=%.1f  persistent=%d entries",
+                self._config.permission.timeout_s, len(load_policy_file(policy_file)),
+            )
+            self._broadcaster = IpcEventBroadcaster(trace=self._trace)
+            self._bus.subscribe(self._broadcaster.handle)
+            compact_provider = AnthropicProvider(
+                self._config.llm.default_model, context_window=self._config.llm.context_window,
+            )
+            self._mcp_manager = McpServerManager()
+            cleanup.push_async_callback(self._mcp_manager.stop_all)
+            if self._config.mcp.servers:
+                await self._mcp_manager.start_all(self._config.mcp.servers)
+            self._sessions = SessionManager(
+                store,
+                runner_factory=lambda: AgentRunner(
+                    self._config,  # type: ignore[arg-type]
+                    bus=self._bus, trace=self._trace,
+                    permission_manager=self._permission_manager, mcp_manager=self._mcp_manager,
+                ),
+                bus=self._bus, provider=compact_provider, config=self._config,
+            )
+            server = SocketServer(
+                self._config.host, self._config.port, self._broadcaster, trace=self._trace,
+            )
+            cleanup.push_async_callback(server.stop)
+            cleanup.push_async_callback(self._shutdown_sessions)
+            cleanup.callback(server.stop_accepting)
+            for method, handler in [
+                ("core.ping", self._ping_handler),
+                ("agent.run", self._agent_run_handler),
+                ("event.subscribe", self._subscribe_handler),
+                ("session.create", self._session_create_handler),
+                ("session.continue", self._session_continue_handler),
+                ("session.resume", self._session_resume_handler),
+                ("session.send_message", self._session_send_handler),
+                ("session.get_history", self._session_history_handler),
+                ("session.close", self._session_close_handler),
+                ("session.clear", self._session_clear_handler),
+                ("session.recover", self._session_recover_handler),
+                ("permission.respond", self._permission_respond_handler),
+                ("session.compact", self._session_compact_handler),
+            ]:
+                server.register(method, handler)
+            addr = await server.start()
+            logger.info("x-core %s listening addr=%s", x_claude.__version__, addr)
+            logger.info("config: %s", self._config)
+            shutdown = asyncio.Event()
+            _install_shutdown_handlers(asyncio.get_running_loop(), shutdown)
+            await shutdown.wait()
+            logger.info("shutting down")
 
-        self._sessions = SessionManager(
-            store,
-            runner_factory=lambda: AgentRunner(
-                self._config,  # type: ignore[arg-type]
-                bus=self._bus,
-                trace=self._trace,
-                permission_manager=self._permission_manager,
-                mcp_manager=self._mcp_manager,
-            ),
-            bus=self._bus,
-            provider=compact_provider,
-            config=self._config,
-        )
-
-        server = SocketServer(
-            self._config.host,
-            self._config.port,
-            self._broadcaster,
-            trace=self._trace,
-        )
-        server.register("core.ping", self._ping_handler)
-        server.register("agent.run", self._agent_run_handler)
-        server.register("event.subscribe", self._subscribe_handler)
-        server.register("session.create", self._session_create_handler)
-        server.register("session.continue", self._session_continue_handler)
-        server.register("session.resume", self._session_resume_handler)
-        server.register("session.send_message", self._session_send_handler)
-        server.register("session.get_history", self._session_history_handler)
-        server.register("session.close", self._session_close_handler)
-        server.register("session.clear", self._session_clear_handler)
-        server.register("session.recover", self._session_recover_handler)
-        server.register("permission.respond", self._permission_respond_handler)
-        server.register("session.compact", self._session_compact_handler)
-
-        addr = await server.start()
-        logger.info("x-core %s listening addr=%s", x_claude.__version__, addr)
-        logger.info("config: %s", self._config)
-
-        loop = asyncio.get_running_loop()
-        shutdown = asyncio.Event()
-        _install_shutdown_handlers(loop, shutdown)
-
-        await shutdown.wait()
-
-        logger.info("shutting down")
-        server.stop_accepting()
-        if self._sessions is not None:
-            await self._sessions.shutdown()
-        for run_task in list(self._running_runs):
-            run_task.cancel()
-        if self._running_runs:
-            await asyncio.gather(*self._running_runs, return_exceptions=True)
-        await server.stop()
-        if self._mcp_manager is not None:
-            await self._mcp_manager.stop_all()
-        if self._trace is not None:
-            await self._trace.stop()
+    # 先标记并挂起会话，再取消一次性请求，即使前者失败也不遗留请求协程
+    async def _shutdown_sessions(self) -> None:
+        try:
+            if self._sessions is not None:
+                await self._sessions.shutdown()
+        finally:
+            for run_task in list(self._running_runs):
+                run_task.cancel()
+            if self._running_runs:
+                await asyncio.gather(*self._running_runs, return_exceptions=True)
 
 
 # 同步入口：启动 CoreApp 事件循环

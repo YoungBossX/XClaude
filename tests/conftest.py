@@ -7,6 +7,7 @@ import subprocess
 import sys
 import time
 from collections.abc import AsyncGenerator
+from pathlib import Path
 
 import pytest
 
@@ -22,16 +23,31 @@ def free_port() -> int:
 
 
 @pytest.fixture
-async def running_daemon(free_port: int) -> AsyncGenerator[subprocess.Popen[bytes], None]:
+async def running_daemon(
+    free_port: int, tmp_path: Path,
+) -> AsyncGenerator[subprocess.Popen[bytes], None]:
     env = os.environ.copy()
     env["X_PORT"] = str(free_port)
     env["X_LOG_FILE"] = ""
     env["X_LOG_LEVEL"] = "WARNING"
 
-    proc = subprocess.Popen([sys.executable, "-m", "x_claude.core"], env=env)
+    # 测试守护进程使用独立存储，不与用户正在运行的 daemon 争用存储锁
+    bootstrap = (
+        "import sys; from pathlib import Path; from unittest.mock import patch; "
+        "import x_claude.core.app as app; "
+        "from x_claude.core.session.store import SessionStore; "
+        "factory = lambda _: SessionStore(Path(sys.argv[1])); "
+        "scope = patch.object(app, 'SessionStore', side_effect=factory); "
+        "scope.start(); app.run()"
+    )
+    proc = subprocess.Popen(
+        [sys.executable, "-c", bootstrap, str(tmp_path / "sessions")], env=env,
+    )
 
-    deadline = time.monotonic() + 3.0
+    deadline = time.monotonic() + 10.0
     while time.monotonic() < deadline:
+        if proc.poll() is not None:
+            pytest.fail(f"Daemon exited during startup with code {proc.returncode}")
         await asyncio.sleep(0.05)
         try:
             _reader, writer = await asyncio.open_connection("127.0.0.1", free_port)
@@ -44,13 +60,14 @@ async def running_daemon(free_port: int) -> AsyncGenerator[subprocess.Popen[byte
     else:
         proc.terminate()
         proc.wait()
-        pytest.fail("Daemon did not start within 3 seconds")
+        pytest.fail("Daemon did not start within 10 seconds")
 
-    yield proc
-
-    proc.terminate()
     try:
-        proc.wait(timeout=2)
-    except subprocess.TimeoutExpired:
-        proc.kill()
-        proc.wait()
+        yield proc
+    finally:
+        proc.terminate()
+        try:
+            proc.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()

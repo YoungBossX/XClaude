@@ -10,6 +10,14 @@ class RuntimeEvent(BaseModel):
     event_id: str = Field(default_factory=lambda: uuid4().hex)
 
 
+class SessionSynchronizedEvent(RuntimeEvent):
+    type: Literal["session.synchronized"] = "session.synchronized"
+    session_id: str
+    status: Literal["active", "waiting_for_input", "closed"]
+    busy: bool
+    ts: str
+
+
 class CoreStartedEvent(RuntimeEvent):
     type: Literal["core.started"] = "core.started"
     listen_addr: str  # e.g. "127.0.0.1:7437"
@@ -257,6 +265,7 @@ Event = Annotated[
     | SessionWaitingForInputEvent
     | SessionResumedEvent
     | SessionClosedEvent
+    | SessionSynchronizedEvent
     | ContextCompactedEvent
     | PermissionRequestedEvent
     | PermissionGrantedEvent
