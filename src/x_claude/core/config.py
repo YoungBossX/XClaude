@@ -35,6 +35,7 @@ class AgentConfig:
 class LlmConfig:
     default_model: str = _DEFAULT_MODEL
     router: str = "static"  # "static" | "rule_based" (S4) | "cost_budget" (S6)
+    context_window: int | None = None  # 兼容模型应显式设置真实窗口；空值使用内建映射
 
 
 @dataclass
@@ -170,7 +171,7 @@ def _apply_toml(config: XConfig, data: dict[str, Any]) -> None:
         llm = data["llm"]
         if not isinstance(llm, dict):
             raise SystemExit("Config error: [llm] must be a table")
-        unknown_llm: set[str] = set(llm.keys()) - {"default_model", "router"}
+        unknown_llm: set[str] = set(llm.keys()) - {"default_model", "router", "context_window"}
         if unknown_llm:
             raise SystemExit(f"Unknown [llm] keys: {', '.join(sorted(unknown_llm))}")
         if "default_model" in llm:
@@ -183,6 +184,11 @@ def _apply_toml(config: XConfig, data: dict[str, Any]) -> None:
             if not isinstance(val, str):
                 raise SystemExit("Config error: llm.router must be a string")
             config.llm.router = val
+        if "context_window" in llm:
+            val = llm["context_window"]
+            if type(val) is not int or val <= 0:
+                raise SystemExit("Config error: llm.context_window must be a positive integer")
+            config.llm.context_window = val
 
     if "trace" in data:
         trace = data["trace"]
@@ -334,6 +340,16 @@ def _apply_env(config: XConfig) -> None:
     default_model = os.environ.get("X_LLM_DEFAULT_MODEL")
     if default_model is not None:
         config.llm.default_model = default_model
+
+    context_window = os.environ.get("X_CONTEXT_WINDOW")
+    if context_window is not None:
+        try:
+            window = int(context_window)
+        except ValueError:
+            raise SystemExit("Config error: X_CONTEXT_WINDOW must be a positive integer") from None
+        if window <= 0:
+            raise SystemExit("Config error: X_CONTEXT_WINDOW must be a positive integer")
+        config.llm.context_window = window
 
     trace_enabled = os.environ.get("X_TRACE_ENABLED")
     if trace_enabled is not None:

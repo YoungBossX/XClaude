@@ -7,6 +7,7 @@ from collections.abc import Awaitable, Callable
 from typing import Any
 
 from x_claude.core.bus.envelope import JsonRpcRequest
+from x_claude.core.transport.auth import read_credential
 
 type EventHandler = Callable[[dict[str, Any]], Awaitable[None]]
 
@@ -27,12 +28,14 @@ class SocketClient:
         self._writer: asyncio.StreamWriter | None = None
         self._pending: dict[str, asyncio.Future[dict[str, Any]]] = {}
         self._event_handlers: list[EventHandler] = []
+        self._auth_token: str | None = None
 
     # 建立到 core 守护进程的 TCP 连接
     async def connect(self) -> None:
         self._reader, self._writer = await asyncio.open_connection(
             self._host, self._port, limit=_MAX_LINE_BYTES
         )
+        self._auth_token = read_credential(self._host, self._port)
 
     # 关闭 TCP 连接并等待底层 socket 释放
     async def close(self) -> None:
@@ -52,12 +55,17 @@ class SocketClient:
         if self._writer is None:
             raise RuntimeError("not connected — call connect() first")
         req_id = str(uuid.uuid4())
-        request = JsonRpcRequest(id=req_id, method=method, params=params)
+        request = JsonRpcRequest(
+            id=req_id, method=method, params=params, auth_token=self._auth_token,
+        )
         fut: asyncio.Future[dict[str, Any]] = asyncio.get_running_loop().create_future()
         self._pending[req_id] = fut
-        self._writer.write(request.model_dump_json().encode() + b"\n")
-        await self._writer.drain()
-        return await fut
+        try:
+            self._writer.write(request.model_dump_json().encode() + b"\n")
+            await self._writer.drain()
+            return await fut
+        finally:
+            self._pending.pop(req_id, None)
 
     # 持续读取服务器消息，分发 RPC 响应到 pending future 或事件到 event handler
     async def run_event_loop(self) -> None:

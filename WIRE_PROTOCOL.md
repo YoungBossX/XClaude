@@ -8,9 +8,68 @@
 - Each message is one `\n`-terminated JSON line (NDJSON)
 - Commands use JSON-RPC 2.0 (client → server); Events use `kind=event` envelope (server → client)
 
+- Non-loopback bind addresses are rejected. Every command requires `auth_token`.
+- Daemon generates a private per-endpoint token in `~/.x/ipc/`; local clients read it automatically.
+- Token files are owner-only (Windows protected DACL / POSIX 0600). Tokens are not traced.
+- Approval replies must match session, run and tool ID and the connection's live subscription.
+
+### JsonRpcRequest
+
+| Field | Type | Required |
+|---|---|---|
+| `jsonrpc` | `string` | no |
+| `id` | `string` | yes |
+| `method` | `string` | yes |
+| `params` | `object` | no |
+| `auth_token` | `string | null` | no |
+
+```json
+{
+  "properties": {
+    "jsonrpc": {
+      "const": "2.0",
+      "default": "2.0",
+      "title": "Jsonrpc",
+      "type": "string"
+    },
+    "id": {
+      "title": "Id",
+      "type": "string"
+    },
+    "method": {
+      "title": "Method",
+      "type": "string"
+    },
+    "params": {
+      "additionalProperties": true,
+      "title": "Params",
+      "type": "object"
+    },
+    "auth_token": {
+      "anyOf": [
+        {
+          "maxLength": 128,
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Auth Token"
+    }
+  },
+  "required": [
+    "id",
+    "method"
+  ],
+  "title": "JsonRpcRequest",
+  "type": "object"
+}
+```
 ## Commands
 
-All commands are sent as JSON-RPC 2.0 requests. The `type` field inside `params` is used for routing.
+All commands are sent as authenticated JSON-RPC 2.0 requests. `method` selects the handler.
 
 ### PingCommand
 
@@ -50,7 +109,8 @@ All commands are sent as JSON-RPC 2.0 requests. The `type` field inside `params`
   "method": "core.ping",
   "params": {
     "client": "cli/0.0.1"
-  }
+  },
+  "auth_token": "<private local IPC credential>"
 }
 ```
 
@@ -140,7 +200,8 @@ All commands are sent as JSON-RPC 2.0 requests. The `type` field inside `params`
   "method": "agent.run",
   "params": {
     "goal": "\u603b\u7ed3 README.md \u7684\u4e3b\u8981\u7ae0\u8282"
-  }
+  },
+  "auth_token": "<private local IPC credential>"
 }
 ```
 
@@ -245,7 +306,8 @@ All commands are sent as JSON-RPC 2.0 requests. The `type` field inside `params`
     ],
     "scope": "global",
     "replay_from_run": null
-  }
+  },
+  "auth_token": "<private local IPC credential>"
 }
 ```
 
@@ -337,7 +399,8 @@ All commands are sent as JSON-RPC 2.0 requests. The `type` field inside `params`
   "params": {
     "mode": "chat",
     "title": ""
-  }
+  },
+  "auth_token": "<private local IPC credential>"
 }
 ```
 
@@ -432,7 +495,8 @@ All commands are sent as JSON-RPC 2.0 requests. The `type` field inside `params`
   "params": {
     "session_id": "sess-abc123def456",
     "content": "\u603b\u7ed3 README.md"
-  }
+  },
+  "auth_token": "<private local IPC credential>"
 }
 ```
 
@@ -580,6 +644,244 @@ All commands are sent as JSON-RPC 2.0 requests. The `type` field inside `params`
   "type": "object"
 }
 ```
+### SessionRecoverCommand
+
+| Field | Type | Required |
+|---|---|---|
+| `type` | `string` | no |
+| `session_id` | `string` | yes |
+| `run_id` | `string | null` | no |
+| `tool_results` | `object | null` | no |
+| `accept_config_change` | `boolean` | no |
+
+```json
+{
+  "$defs": {
+    "RecoveredToolResult": {
+      "properties": {
+        "content": {
+          "title": "Content",
+          "type": "string"
+        },
+        "is_error": {
+          "default": false,
+          "title": "Is Error",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "content"
+      ],
+      "title": "RecoveredToolResult",
+      "type": "object"
+    }
+  },
+  "properties": {
+    "type": {
+      "const": "session.recover",
+      "default": "session.recover",
+      "title": "Type",
+      "type": "string"
+    },
+    "session_id": {
+      "title": "Session Id",
+      "type": "string"
+    },
+    "run_id": {
+      "anyOf": [
+        {
+          "pattern": "^[A-Za-z0-9_-]+$",
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Run Id"
+    },
+    "tool_results": {
+      "anyOf": [
+        {
+          "additionalProperties": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "$ref": "#/$defs/RecoveredToolResult"
+              }
+            ]
+          },
+          "type": "object"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Tool Results"
+    },
+    "accept_config_change": {
+      "default": false,
+      "title": "Accept Config Change",
+      "type": "boolean"
+    }
+  },
+  "required": [
+    "session_id"
+  ],
+  "title": "SessionRecoverCommand",
+  "type": "object"
+}
+```
+### SessionRecoverResult
+
+| Field | Type | Required |
+|---|---|---|
+| `tasks` | `array` | yes |
+
+```json
+{
+  "$defs": {
+    "BackgroundTaskInfo": {
+      "properties": {
+        "run_id": {
+          "title": "Run Id",
+          "type": "string"
+        },
+        "kind": {
+          "default": "background",
+          "enum": [
+            "background",
+            "root"
+          ],
+          "title": "Kind",
+          "type": "string"
+        },
+        "state": {
+          "title": "State",
+          "type": "string"
+        },
+        "phase": {
+          "title": "Phase",
+          "type": "string"
+        },
+        "step": {
+          "title": "Step",
+          "type": "integer"
+        },
+        "message": {
+          "default": "",
+          "title": "Message",
+          "type": "string"
+        },
+        "pending_tools": {
+          "items": {
+            "additionalProperties": true,
+            "type": "object"
+          },
+          "title": "Pending Tools",
+          "type": "array"
+        }
+      },
+      "required": [
+        "run_id",
+        "state",
+        "phase",
+        "step"
+      ],
+      "title": "BackgroundTaskInfo",
+      "type": "object"
+    }
+  },
+  "properties": {
+    "tasks": {
+      "items": {
+        "$ref": "#/$defs/BackgroundTaskInfo"
+      },
+      "title": "Tasks",
+      "type": "array"
+    }
+  },
+  "required": [
+    "tasks"
+  ],
+  "title": "SessionRecoverResult",
+  "type": "object"
+}
+```
+### PermissionRespondCommand
+
+| Field | Type | Required |
+|---|---|---|
+| `type` | `string` | no |
+| `tool_use_id` | `string` | yes |
+| `session_id` | `string` | yes |
+| `run_id` | `string` | yes |
+| `decision` | `string` | yes |
+
+```json
+{
+  "properties": {
+    "type": {
+      "const": "permission.respond",
+      "default": "permission.respond",
+      "title": "Type",
+      "type": "string"
+    },
+    "tool_use_id": {
+      "title": "Tool Use Id",
+      "type": "string"
+    },
+    "session_id": {
+      "title": "Session Id",
+      "type": "string"
+    },
+    "run_id": {
+      "title": "Run Id",
+      "type": "string"
+    },
+    "decision": {
+      "enum": [
+        "allow_once",
+        "always_allow",
+        "deny_once",
+        "always_deny"
+      ],
+      "title": "Decision",
+      "type": "string"
+    }
+  },
+  "required": [
+    "tool_use_id",
+    "session_id",
+    "run_id",
+    "decision"
+  ],
+  "title": "PermissionRespondCommand",
+  "type": "object"
+}
+```
+### PermissionRespondResult
+
+| Field | Type | Required |
+|---|---|---|
+| `ok` | `boolean` | no |
+
+```json
+{
+  "properties": {
+    "ok": {
+      "default": true,
+      "title": "Ok",
+      "type": "boolean"
+    }
+  },
+  "title": "PermissionRespondResult",
+  "type": "object"
+}
+```
 
 ## Server Push
 
@@ -637,6 +939,7 @@ Events sent over the IPC socket (daemon → client).
 
 | Field | Type | Required |
 |---|---|---|
+| `event_id` | `string` | no |
 | `type` | `string` | no |
 | `listen_addr` | `string` | yes |
 | `version` | `string` | yes |
@@ -644,6 +947,10 @@ Events sent over the IPC socket (daemon → client).
 ```json
 {
   "properties": {
+    "event_id": {
+      "title": "Event Id",
+      "type": "string"
+    },
     "type": {
       "const": "core.started",
       "default": "core.started",
@@ -676,14 +983,21 @@ Events written to `runs/<run_id>/events.jsonl` and forwarded over IPC to subscri
 
 | Field | Type | Required |
 |---|---|---|
+| `event_id` | `string` | no |
 | `type` | `string` | no |
 | `run_id` | `string` | yes |
+| `session_id` | `string` | no |
+| `resumed` | `boolean` | no |
 | `goal` | `string` | yes |
 | `ts` | `string` | yes |
 
 ```json
 {
   "properties": {
+    "event_id": {
+      "title": "Event Id",
+      "type": "string"
+    },
     "type": {
       "const": "run.started",
       "default": "run.started",
@@ -693,6 +1007,16 @@ Events written to `runs/<run_id>/events.jsonl` and forwarded over IPC to subscri
     "run_id": {
       "title": "Run Id",
       "type": "string"
+    },
+    "session_id": {
+      "default": "",
+      "title": "Session Id",
+      "type": "string"
+    },
+    "resumed": {
+      "default": false,
+      "title": "Resumed",
+      "type": "boolean"
     },
     "goal": {
       "title": "Goal",
@@ -724,10 +1048,75 @@ Events written to `runs/<run_id>/events.jsonl` and forwarded over IPC to subscri
 }
 ```
 
+### RunRestoredEvent
+
+| Field | Type | Required |
+|---|---|---|
+| `event_id` | `string` | no |
+| `type` | `string` | no |
+| `run_id` | `string` | yes |
+| `session_id` | `string` | yes |
+| `state` | `string` | yes |
+| `step` | `integer` | yes |
+| `message` | `string` | yes |
+| `ts` | `string` | yes |
+
+```json
+{
+  "properties": {
+    "event_id": {
+      "title": "Event Id",
+      "type": "string"
+    },
+    "type": {
+      "const": "run.restored",
+      "default": "run.restored",
+      "title": "Type",
+      "type": "string"
+    },
+    "run_id": {
+      "title": "Run Id",
+      "type": "string"
+    },
+    "session_id": {
+      "title": "Session Id",
+      "type": "string"
+    },
+    "state": {
+      "title": "State",
+      "type": "string"
+    },
+    "step": {
+      "title": "Step",
+      "type": "integer"
+    },
+    "message": {
+      "title": "Message",
+      "type": "string"
+    },
+    "ts": {
+      "title": "Ts",
+      "type": "string"
+    }
+  },
+  "required": [
+    "run_id",
+    "session_id",
+    "state",
+    "step",
+    "message",
+    "ts"
+  ],
+  "title": "RunRestoredEvent",
+  "type": "object"
+}
+```
+
 ### RunFinishedEvent
 
 | Field | Type | Required |
 |---|---|---|
+| `event_id` | `string` | no |
 | `type` | `string` | no |
 | `run_id` | `string` | yes |
 | `status` | `string` | yes |
@@ -738,6 +1127,10 @@ Events written to `runs/<run_id>/events.jsonl` and forwarded over IPC to subscri
 ```json
 {
   "properties": {
+    "event_id": {
+      "title": "Event Id",
+      "type": "string"
+    },
     "type": {
       "const": "run.finished",
       "default": "run.finished",
@@ -801,6 +1194,7 @@ Events written to `runs/<run_id>/events.jsonl` and forwarded over IPC to subscri
 
 | Field | Type | Required |
 |---|---|---|
+| `event_id` | `string` | no |
 | `type` | `string` | no |
 | `run_id` | `string` | yes |
 | `step` | `integer` | yes |
@@ -809,6 +1203,10 @@ Events written to `runs/<run_id>/events.jsonl` and forwarded over IPC to subscri
 ```json
 {
   "properties": {
+    "event_id": {
+      "title": "Event Id",
+      "type": "string"
+    },
     "type": {
       "const": "step.started",
       "default": "step.started",
@@ -853,6 +1251,7 @@ Events written to `runs/<run_id>/events.jsonl` and forwarded over IPC to subscri
 
 | Field | Type | Required |
 |---|---|---|
+| `event_id` | `string` | no |
 | `type` | `string` | no |
 | `run_id` | `string` | yes |
 | `step` | `integer` | yes |
@@ -861,6 +1260,10 @@ Events written to `runs/<run_id>/events.jsonl` and forwarded over IPC to subscri
 ```json
 {
   "properties": {
+    "event_id": {
+      "title": "Event Id",
+      "type": "string"
+    },
     "type": {
       "const": "step.finished",
       "default": "step.finished",
@@ -905,6 +1308,7 @@ Events written to `runs/<run_id>/events.jsonl` and forwarded over IPC to subscri
 
 | Field | Type | Required |
 |---|---|---|
+| `event_id` | `string` | no |
 | `type` | `string` | no |
 | `run_id` | `string` | yes |
 | `tool_use_id` | `string` | yes |
@@ -915,6 +1319,10 @@ Events written to `runs/<run_id>/events.jsonl` and forwarded over IPC to subscri
 ```json
 {
   "properties": {
+    "event_id": {
+      "title": "Event Id",
+      "type": "string"
+    },
     "type": {
       "const": "tool.call_started",
       "default": "tool.call_started",
@@ -974,6 +1382,7 @@ Events written to `runs/<run_id>/events.jsonl` and forwarded over IPC to subscri
 
 | Field | Type | Required |
 |---|---|---|
+| `event_id` | `string` | no |
 | `type` | `string` | no |
 | `run_id` | `string` | yes |
 | `tool_use_id` | `string` | yes |
@@ -985,6 +1394,10 @@ Events written to `runs/<run_id>/events.jsonl` and forwarded over IPC to subscri
 ```json
 {
   "properties": {
+    "event_id": {
+      "title": "Event Id",
+      "type": "string"
+    },
     "type": {
       "const": "tool.call_finished",
       "default": "tool.call_finished",
@@ -1046,6 +1459,7 @@ Events written to `runs/<run_id>/events.jsonl` and forwarded over IPC to subscri
 
 | Field | Type | Required |
 |---|---|---|
+| `event_id` | `string` | no |
 | `type` | `string` | no |
 | `run_id` | `string` | yes |
 | `tool_use_id` | `string` | yes |
@@ -1059,6 +1473,10 @@ Events written to `runs/<run_id>/events.jsonl` and forwarded over IPC to subscri
 ```json
 {
   "properties": {
+    "event_id": {
+      "title": "Event Id",
+      "type": "string"
+    },
     "type": {
       "const": "tool.call_failed",
       "default": "tool.call_failed",
@@ -1133,6 +1551,7 @@ Events written to `runs/<run_id>/events.jsonl` and forwarded over IPC to subscri
 
 | Field | Type | Required |
 |---|---|---|
+| `event_id` | `string` | no |
 | `type` | `string` | no |
 | `run_id` | `string` | yes |
 | `model` | `string` | yes |
@@ -1142,6 +1561,10 @@ Events written to `runs/<run_id>/events.jsonl` and forwarded over IPC to subscri
 ```json
 {
   "properties": {
+    "event_id": {
+      "title": "Event Id",
+      "type": "string"
+    },
     "type": {
       "const": "llm.model_selected",
       "default": "llm.model_selected",
@@ -1192,6 +1615,7 @@ Events written to `runs/<run_id>/events.jsonl` and forwarded over IPC to subscri
 
 | Field | Type | Required |
 |---|---|---|
+| `event_id` | `string` | no |
 | `type` | `string` | no |
 | `run_id` | `string` | yes |
 | `token` | `string` | yes |
@@ -1200,6 +1624,10 @@ Events written to `runs/<run_id>/events.jsonl` and forwarded over IPC to subscri
 ```json
 {
   "properties": {
+    "event_id": {
+      "title": "Event Id",
+      "type": "string"
+    },
     "type": {
       "const": "llm.token",
       "default": "llm.token",
@@ -1244,6 +1672,7 @@ Events written to `runs/<run_id>/events.jsonl` and forwarded over IPC to subscri
 
 | Field | Type | Required |
 |---|---|---|
+| `event_id` | `string` | no |
 | `type` | `string` | no |
 | `run_id` | `string` | yes |
 | `input_tokens` | `integer` | yes |
@@ -1251,11 +1680,16 @@ Events written to `runs/<run_id>/events.jsonl` and forwarded over IPC to subscri
 | `cache_read_input_tokens` | `integer` | yes |
 | `cache_creation_input_tokens` | `integer` | yes |
 | `context_pct` | `number` | no |
+| `context_window` | `integer` | no |
 | `ts` | `string` | yes |
 
 ```json
 {
   "properties": {
+    "event_id": {
+      "title": "Event Id",
+      "type": "string"
+    },
     "type": {
       "const": "llm.usage",
       "default": "llm.usage",
@@ -1286,6 +1720,11 @@ Events written to `runs/<run_id>/events.jsonl` and forwarded over IPC to subscri
       "default": 0.0,
       "title": "Context Pct",
       "type": "number"
+    },
+    "context_window": {
+      "default": 0,
+      "title": "Context Window",
+      "type": "integer"
     },
     "ts": {
       "title": "Ts",
@@ -1323,6 +1762,7 @@ Events written to `runs/<run_id>/events.jsonl` and forwarded over IPC to subscri
 
 | Field | Type | Required |
 |---|---|---|
+| `event_id` | `string` | no |
 | `type` | `string` | no |
 | `run_id` | `string` | yes |
 | `level` | `string` | yes |
@@ -1333,6 +1773,10 @@ Events written to `runs/<run_id>/events.jsonl` and forwarded over IPC to subscri
 ```json
 {
   "properties": {
+    "event_id": {
+      "title": "Event Id",
+      "type": "string"
+    },
     "type": {
       "const": "log.line",
       "default": "log.line",
@@ -1391,6 +1835,7 @@ Events written to `runs/<run_id>/events.jsonl` and forwarded over IPC to subscri
 
 | Field | Type | Required |
 |---|---|---|
+| `event_id` | `string` | no |
 | `type` | `string` | no |
 | `session_id` | `string` | yes |
 | `mode` | `string` | yes |
@@ -1399,6 +1844,10 @@ Events written to `runs/<run_id>/events.jsonl` and forwarded over IPC to subscri
 ```json
 {
   "properties": {
+    "event_id": {
+      "title": "Event Id",
+      "type": "string"
+    },
     "type": {
       "const": "session.created",
       "default": "session.created",
@@ -1443,6 +1892,7 @@ Events written to `runs/<run_id>/events.jsonl` and forwarded over IPC to subscri
 
 | Field | Type | Required |
 |---|---|---|
+| `event_id` | `string` | no |
 | `type` | `string` | no |
 | `session_id` | `string` | yes |
 | `content` | `string` | yes |
@@ -1451,6 +1901,10 @@ Events written to `runs/<run_id>/events.jsonl` and forwarded over IPC to subscri
 ```json
 {
   "properties": {
+    "event_id": {
+      "title": "Event Id",
+      "type": "string"
+    },
     "type": {
       "const": "session.message_received",
       "default": "session.message_received",
@@ -1495,6 +1949,7 @@ Events written to `runs/<run_id>/events.jsonl` and forwarded over IPC to subscri
 
 | Field | Type | Required |
 |---|---|---|
+| `event_id` | `string` | no |
 | `type` | `string` | no |
 | `session_id` | `string` | yes |
 | `last_run_id` | `string` | yes |
@@ -1503,6 +1958,10 @@ Events written to `runs/<run_id>/events.jsonl` and forwarded over IPC to subscri
 ```json
 {
   "properties": {
+    "event_id": {
+      "title": "Event Id",
+      "type": "string"
+    },
     "type": {
       "const": "session.waiting_for_input",
       "default": "session.waiting_for_input",
@@ -1547,6 +2006,7 @@ Events written to `runs/<run_id>/events.jsonl` and forwarded over IPC to subscri
 
 | Field | Type | Required |
 |---|---|---|
+| `event_id` | `string` | no |
 | `type` | `string` | no |
 | `session_id` | `string` | yes |
 | `ts` | `string` | yes |
@@ -1554,6 +2014,10 @@ Events written to `runs/<run_id>/events.jsonl` and forwarded over IPC to subscri
 ```json
 {
   "properties": {
+    "event_id": {
+      "title": "Event Id",
+      "type": "string"
+    },
     "type": {
       "const": "session.resumed",
       "default": "session.resumed",
@@ -1592,6 +2056,7 @@ Events written to `runs/<run_id>/events.jsonl` and forwarded over IPC to subscri
 
 | Field | Type | Required |
 |---|---|---|
+| `event_id` | `string` | no |
 | `type` | `string` | no |
 | `session_id` | `string` | yes |
 | `ts` | `string` | yes |
@@ -1599,6 +2064,10 @@ Events written to `runs/<run_id>/events.jsonl` and forwarded over IPC to subscri
 ```json
 {
   "properties": {
+    "event_id": {
+      "title": "Event Id",
+      "type": "string"
+    },
     "type": {
       "const": "session.closed",
       "default": "session.closed",
@@ -1630,6 +2099,206 @@ Events written to `runs/<run_id>/events.jsonl` and forwarded over IPC to subscri
   "type": "session.closed",
   "session_id": "sess-abc123def456",
   "ts": "2026-05-16T10:00:00.001Z"
+}
+```
+
+## Subagent Events
+
+### SubagentStartedEvent
+
+| Field | Type | Required |
+|---|---|---|
+| `event_id` | `string` | no |
+| `type` | `string` | no |
+| `run_id` | `string` | yes |
+| `parent_run_id` | `string` | yes |
+| `description` | `string` | yes |
+| `ts` | `string` | yes |
+| `session_id` | `string` | no |
+| `resumed` | `boolean` | no |
+
+```json
+{
+  "properties": {
+    "event_id": {
+      "title": "Event Id",
+      "type": "string"
+    },
+    "type": {
+      "const": "subagent.started",
+      "default": "subagent.started",
+      "title": "Type",
+      "type": "string"
+    },
+    "run_id": {
+      "title": "Run Id",
+      "type": "string"
+    },
+    "parent_run_id": {
+      "title": "Parent Run Id",
+      "type": "string"
+    },
+    "description": {
+      "title": "Description",
+      "type": "string"
+    },
+    "ts": {
+      "title": "Ts",
+      "type": "string"
+    },
+    "session_id": {
+      "default": "",
+      "title": "Session Id",
+      "type": "string"
+    },
+    "resumed": {
+      "default": false,
+      "title": "Resumed",
+      "type": "boolean"
+    }
+  },
+  "required": [
+    "run_id",
+    "parent_run_id",
+    "description",
+    "ts"
+  ],
+  "title": "SubagentStartedEvent",
+  "type": "object"
+}
+```
+
+### SubagentRestoredEvent
+
+| Field | Type | Required |
+|---|---|---|
+| `event_id` | `string` | no |
+| `type` | `string` | no |
+| `run_id` | `string` | yes |
+| `session_id` | `string` | yes |
+| `parent_run_id` | `string` | yes |
+| `description` | `string` | yes |
+| `state` | `string` | yes |
+| `step` | `integer` | yes |
+| `message` | `string` | yes |
+| `ts` | `string` | yes |
+
+```json
+{
+  "properties": {
+    "event_id": {
+      "title": "Event Id",
+      "type": "string"
+    },
+    "type": {
+      "const": "subagent.restored",
+      "default": "subagent.restored",
+      "title": "Type",
+      "type": "string"
+    },
+    "run_id": {
+      "title": "Run Id",
+      "type": "string"
+    },
+    "session_id": {
+      "title": "Session Id",
+      "type": "string"
+    },
+    "parent_run_id": {
+      "title": "Parent Run Id",
+      "type": "string"
+    },
+    "description": {
+      "title": "Description",
+      "type": "string"
+    },
+    "state": {
+      "title": "State",
+      "type": "string"
+    },
+    "step": {
+      "title": "Step",
+      "type": "integer"
+    },
+    "message": {
+      "title": "Message",
+      "type": "string"
+    },
+    "ts": {
+      "title": "Ts",
+      "type": "string"
+    }
+  },
+  "required": [
+    "run_id",
+    "session_id",
+    "parent_run_id",
+    "description",
+    "state",
+    "step",
+    "message",
+    "ts"
+  ],
+  "title": "SubagentRestoredEvent",
+  "type": "object"
+}
+```
+
+### SubagentFinishedEvent
+
+| Field | Type | Required |
+|---|---|---|
+| `event_id` | `string` | no |
+| `type` | `string` | no |
+| `run_id` | `string` | yes |
+| `parent_run_id` | `string` | yes |
+| `status` | `string` | yes |
+| `ts` | `string` | yes |
+| `session_id` | `string` | no |
+
+```json
+{
+  "properties": {
+    "event_id": {
+      "title": "Event Id",
+      "type": "string"
+    },
+    "type": {
+      "const": "subagent.finished",
+      "default": "subagent.finished",
+      "title": "Type",
+      "type": "string"
+    },
+    "run_id": {
+      "title": "Run Id",
+      "type": "string"
+    },
+    "parent_run_id": {
+      "title": "Parent Run Id",
+      "type": "string"
+    },
+    "status": {
+      "title": "Status",
+      "type": "string"
+    },
+    "ts": {
+      "title": "Ts",
+      "type": "string"
+    },
+    "session_id": {
+      "default": "",
+      "title": "Session Id",
+      "type": "string"
+    }
+  },
+  "required": [
+    "run_id",
+    "parent_run_id",
+    "status",
+    "ts"
+  ],
+  "title": "SubagentFinishedEvent",
+  "type": "object"
 }
 ```
 

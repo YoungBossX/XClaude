@@ -10,6 +10,8 @@ from collections.abc import AsyncGenerator
 
 import pytest
 
+from x_claude.core.transport.auth import read_credential
+
 
 @pytest.fixture
 def free_port() -> int:
@@ -35,7 +37,8 @@ async def running_daemon(free_port: int) -> AsyncGenerator[subprocess.Popen[byte
             _reader, writer = await asyncio.open_connection("127.0.0.1", free_port)
             writer.close()
             await writer.wait_closed()
-            break
+            if read_credential("127.0.0.1", free_port) is not None:
+                break
         except (ConnectionRefusedError, OSError):
             pass
     else:

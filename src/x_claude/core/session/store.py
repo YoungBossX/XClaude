@@ -38,10 +38,9 @@ class SessionStore:
     def write_meta(self, session: Session) -> None:
         path = self.session_dir(session.id)
         path.mkdir(parents=True, exist_ok=True)
-        (path / "meta.json").write_text(
-            json.dumps(session.to_dict(), ensure_ascii=False, indent=2) + "\n",
-            encoding="utf-8",
-        )
+        atomic_write_bytes(path / "meta.json", (
+            json.dumps(session.to_dict(), ensure_ascii=False, indent=2) + "\n"
+        ).encode("utf-8"))
 
     # 从 meta.json 读取 session meta
     def read_meta(self, sid: str) -> Session:
@@ -79,14 +78,21 @@ class SessionStore:
         with (path / "thread.jsonl").open("a", encoding="utf-8") as f:
             f.write(json.dumps(row, ensure_ascii=False) + "\n")
 
-    # 将一次运行产生的消息完整序列化，再原子追加到历史文件以避免半批消息
+    # 普通批次原子追加，主任务按提交标识幂等写回完整上下文，避免恢复后重复追加
     def append_messages(
         self,
         sid: str,
         messages: list[dict[str, Any]],
         run_id: str,
+        *, replace_history: bool = False,
     ) -> None:
         if not messages:
+            return
+        path = self.session_dir(sid) / "thread.jsonl"
+        original = path.read_bytes() if path.exists() else b""
+        existing = ([json.loads(line) for line in original.decode("utf-8").splitlines() if line]
+                    if replace_history else [])
+        if replace_history and any(row.get("root_commit") == run_id for row in existing):
             return
         rows = [
             json.dumps(
@@ -96,12 +102,22 @@ class SessionStore:
             ) + "\n"
             for msg in messages
         ]
-        path = self.session_dir(sid) / "thread.jsonl"
-        original = path.read_bytes() if path.exists() else b""
-        atomic_write_bytes(path, original + "".join(rows).encode("utf-8"))
+        if replace_history:
+            replacement: list[dict[str, Any]] = []
+            for index, message in enumerate(messages):
+                old = existing[index] if index < len(existing) else {}
+                if old.get("role") == message["role"] and old.get("content") == message["content"]:
+                    replacement.append(dict(old))
+                else:
+                    replacement.append({"ts": _now(), **message, "run_id": run_id})
+            replacement[-1]["root_commit"] = run_id
+            payload = "".join(json.dumps(row, ensure_ascii=False) + "\n" for row in replacement)
+            atomic_write_bytes(path, payload.encode("utf-8"))
+        else:
+            atomic_write_bytes(path, original + "".join(rows).encode("utf-8"))
 
     # 读取完整 thread 并返回可直接传给 Anthropic 的 messages
-    def read_messages(self, sid: str) -> list[dict[str, Any]]:
+    def read_messages(self, sid: str, *, truncate: bool = True) -> list[dict[str, Any]]:
         path = self.session_dir(sid) / "thread.jsonl"
         if not path.exists():
             return []
@@ -127,6 +143,8 @@ class SessionStore:
             messages.append({"role": role, "content": row.get("content", "")})
 
         messages = self._trim_orphan_tool_use(messages)
+        if not truncate:
+            return messages
         from x_claude.core.compact.budget import truncate_tool_results
         return truncate_tool_results(messages)
 

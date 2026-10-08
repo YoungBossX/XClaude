@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING, Any
 
 from x_claude.core.atomic_file import atomic_write_bytes
 from x_claude.core.bus.events import ContextCompactedEvent
+from x_claude.core.compact.budget import truncate_tool_results
 from x_claude.core.events.bus import EventBus
 
 if TYPE_CHECKING:
@@ -70,12 +71,15 @@ class Compactor:
     def __init__(
         self, bus: EventBus, session_dir: Path, session_id: str,
         *, store: SessionStore | None = None, timeout_s: float = 60.0,
+        tool_result_limit: int = 8_000, tool_result_keep: int = 4_000,
     ) -> None:
         self._bus = bus
         self._session_dir = session_dir
         self._session_id = session_id
         self._store = store
         self._timeout_s = timeout_s
+        self._tool_result_limit = tool_result_limit
+        self._tool_result_keep = tool_result_keep
 
     # 先保存摘要和可选会话历史，再无等待地切换内存上下文，最后发送可隔离异常的完成通知
     async def compact(
@@ -131,7 +135,9 @@ class Compactor:
             len(str(m.get("content", ""))) for m in messages
         ) // 4  # 粗略 token 估算（字符数 / 4）
 
-        history_text = _messages_to_text(messages)
+        history_text = _messages_to_text(truncate_tool_results(
+            messages, self._tool_result_limit, self._tool_result_keep,
+        ))
         prompt = _COMPACT_PROMPT
         if focus.strip():
             prompt += f"\n\nIMPORTANT: Pay special attention to: {focus.strip()}"

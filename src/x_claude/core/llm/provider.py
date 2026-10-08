@@ -4,6 +4,7 @@ import asyncio
 import logging
 import os
 from datetime import UTC, datetime
+from functools import lru_cache
 from typing import Any
 
 import anthropic
@@ -26,7 +27,12 @@ log = logging.getLogger(__name__)
 
 
 # 返回指定模型的最大 context window token 数
+@lru_cache(maxsize=128)
 def _context_window(model: str) -> int:
+    if model not in _MODEL_CONTEXT_WINDOWS:
+        log.warning(
+            "unknown model context window: %s; assuming 200000, set X_CONTEXT_WINDOW", model,
+        )
     return _MODEL_CONTEXT_WINDOWS.get(model, 200_000)
 
 
@@ -44,7 +50,9 @@ def _now() -> str:
 
 class AnthropicProvider:
     # 初始化 Anthropic 客户端；client 可在测试时注入以跳过 API key 检查
-    def __init__(self, model: str, client: Any = None) -> None:
+    def __init__(
+        self, model: str, client: Any = None, *, context_window: int | None = None,
+    ) -> None:
         if client is None:
             api_key = os.environ.get("ANTHROPIC_API_KEY")
             if not api_key:
@@ -53,6 +61,7 @@ class AnthropicProvider:
         else:
             self._client = client
         self._model = model
+        self._context_window = context_window or _context_window(model)
 
     # 流式调用 Anthropic API，逐 token 发布事件并返回 LlmResponse；网络中断时自动重试
     async def chat(
@@ -125,7 +134,7 @@ class AnthropicProvider:
         usage = final_message.usage
         cache_read: int = getattr(usage, "cache_read_input_tokens", 0) or 0
         cache_create: int = getattr(usage, "cache_creation_input_tokens", 0) or 0
-        context_pct = usage.input_tokens / _context_window(self._model)
+        context_pct = (usage.input_tokens + cache_read + cache_create) / self._context_window
 
         await bus.publish(
             LlmUsageEvent(
@@ -136,6 +145,7 @@ class AnthropicProvider:
                 cache_creation_input_tokens=cache_create,
                 context_pct=context_pct,
                 ts=_now(),
+                context_window=self._context_window,
             )
         )
 
@@ -161,5 +171,6 @@ class AnthropicProvider:
                 cache_read_input_tokens=cache_read,
                 cache_creation_input_tokens=cache_create,
                 context_pct=context_pct,
+                context_window=self._context_window,
             ),
         )

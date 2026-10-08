@@ -15,6 +15,7 @@ from x_claude.core.tools.registry import ToolRegistry
 class _FailNTimes(BaseTool):
     """Fails with runtime_error for the first n calls, then succeeds."""
     name = "fail_n"
+    retry_safe = True
     description = "Fails n times then succeeds"
     input_schema: dict[str, object] = {"type": "object", "properties": {}, "required": []}
 
@@ -32,6 +33,7 @@ class _FailNTimes(BaseTool):
 class _RateLimitedNTimes(BaseTool):
     """Raises RateLimitedError for the first n calls, then succeeds."""
     name = "rate_n"
+    retry_safe = True
     description = "Rate-limits n times then succeeds"
     input_schema: dict[str, object] = {"type": "object", "properties": {}, "required": []}
 
@@ -47,6 +49,7 @@ class _RateLimitedNTimes(BaseTool):
 
 class _AlwaysFails(BaseTool):
     name = "always_fail"
+    retry_safe = True
     description = "Always fails"
     input_schema: dict[str, object] = {"type": "object", "properties": {}, "required": []}
 

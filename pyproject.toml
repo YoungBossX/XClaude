@@ -12,6 +12,7 @@ version = "0.0.1"
 requires-python = ">=3.12,<3.13" # 仅支持 3.12 小版本范围，与 CI/类型检查一致
 dependencies = [
     "pydantic>=2.0",       # 数据校验与序列化（含 JSON 模型等）
+    "jsonschema>=4.18",    # MCP 等动态工具的 JSON Schema 参数校验
     "python-dotenv>=1.0",  # .env 文件解析
     "anthropic>=0.25",     # Anthropic LLM SDK（流式 + prompt caching）
     "textual>=0.75",       # 终端 UI 框架（x-tui）
@@ -33,6 +34,7 @@ packages = ["src/x_claude"] # 源码在 src/x_claude
 dev = [
     "ruff>=0.4",            # 快速 linter + import 排序等
     "mypy>=1.10",           # 静态类型检查
+    "types-jsonschema>=4.18", # JSON Schema 库类型声明
     "pytest>=8.0",          # 单元测试
     "pytest-asyncio>=0.23", # 异步测试支持
 ]

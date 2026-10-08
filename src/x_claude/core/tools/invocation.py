@@ -5,6 +5,8 @@ import time
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
+from jsonschema.exceptions import SchemaError
+from jsonschema.exceptions import ValidationError as JsonSchemaValidationError
 from pydantic import ValidationError
 
 from x_claude.core.bus.events import (
@@ -19,6 +21,7 @@ from x_claude.core.events.bus import EventBus
 from x_claude.core.llm.types import ToolCallBlock
 from x_claude.core.tools.base import ToolResult
 from x_claude.core.tools.errors import RateLimitedError
+from x_claude.core.tools.file_access import file_access_scope
 from x_claude.core.tools.registry import ToolRegistry
 
 if TYPE_CHECKING:
@@ -70,6 +73,7 @@ async def invoke_tool(
     *,
     permission_manager: PermissionManager | None = None,
     session_id: str = "",
+    file_versions: dict[str, str | None] | None = None,
 ) -> ToolResult:
     t0 = time.monotonic()
 
@@ -93,14 +97,13 @@ async def invoke_tool(
             "runtime_error", f"unknown tool: {tool_call.name}", elapsed(),
         )
 
-    if tool.params_model is not None:
-        try:
-            tool.params_model.model_validate(dict(tool_call.input))
-        except ValidationError as exc:
-            return await _fail(
-                bus, run_id, tool_call,
-                "schema_error", str(exc), elapsed(),
-            )
+    try:
+        tool.validate_params(dict(tool_call.input))
+    except (ValidationError, JsonSchemaValidationError, SchemaError) as exc:
+        return await _fail(
+            bus, run_id, tool_call,
+            "schema_error", str(exc), elapsed(),
+        )
 
     if permission_manager is not None:
         async def _emit_permission(raw: dict[str, Any]) -> None:
@@ -112,6 +115,7 @@ async def invoke_tool(
             params=dict(tool_call.input),
             session_id=session_id,
             event_emitter=_emit_permission,
+            run_id=run_id,
         )
         if allowed:
             if decision not in ("auto_allow",):
@@ -146,9 +150,10 @@ async def invoke_tool(
         error_message: str | None = None
 
         try:
-            result = await asyncio.wait_for(
-                tool.invoke(dict(tool_call.input)), timeout=timeout
-            )
+            with file_access_scope(file_versions):
+                result = await asyncio.wait_for(
+                    tool.invoke(dict(tool_call.input)), timeout=timeout
+                )
             ms = elapsed()
 
             if result.is_error:
@@ -183,7 +188,7 @@ async def invoke_tool(
         assert error_class is not None and error_message is not None
         ms = elapsed()
 
-        if error_class in _RETRYABLE and attempt <= _MAX_RETRIES:
+        if tool.retry_safe and error_class in _RETRYABLE and attempt <= _MAX_RETRIES:
             await bus.publish(
                 ToolCallFailedEvent(
                     run_id=run_id,

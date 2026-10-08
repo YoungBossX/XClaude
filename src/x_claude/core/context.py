@@ -20,6 +20,8 @@ class ExecutionContext:
     result: str = ""
     # skill 或 subagent 角色可覆盖默认 system prompt
     system_prompt_override: str | None = None
+    # 每个任务独立记录文件读取版本，不能继承其他 Agent 的覆盖权限
+    file_versions: dict[str, str | None] = field(default_factory=dict)
 
     # 初始化消息历史，优先使用 session 完整回放内容
     def __post_init__(self) -> None:

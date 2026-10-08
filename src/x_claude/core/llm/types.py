@@ -10,6 +10,7 @@ class UsageStats:
     cache_read_input_tokens: int = 0
     cache_creation_input_tokens: int = 0
     context_pct: float = 0.0
+    context_window: int = 0
 
 
 @dataclass

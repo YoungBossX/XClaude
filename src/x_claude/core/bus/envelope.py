@@ -10,6 +10,7 @@ class JsonRpcRequest(BaseModel):
     id: str
     method: str
     params: dict[str, Any] = Field(default_factory=dict)
+    auth_token: str | None = Field(default=None, repr=False, max_length=128)
 
 
 class EventPushEnvelope(BaseModel):
@@ -40,6 +41,7 @@ INVALID_REQUEST = -32600  # 请求格式错误
 METHOD_NOT_FOUND = -32601 # 方法不存在
 INVALID_PARAMS = -32602   # 参数错误
 INTERNAL_ERROR = -32603   # 服务器内部错误
+UNAUTHORIZED = -32001    # 本机 IPC 凭据缺失或错误
 
 
 class HandlerError(Exception):

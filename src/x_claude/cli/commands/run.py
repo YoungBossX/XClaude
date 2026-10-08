@@ -87,14 +87,18 @@ async def _run_async(goal: str, config: XConfig) -> int:
     loop_task = asyncio.create_task(client.run_event_loop())
 
     try:
+        created = await client.send_command("session.create", {"mode": "one_shot"})
+        session_id = str(created["session_id"])
         await client.send_command(
             "event.subscribe",
             {
                 "topics": ["run.*", "step.*", "tool.*", "llm.token", "llm.usage"],
-                "scope": "global",
+                "scope": f"session:{session_id}",
             },
         )
-        await client.send_command("agent.run", {"goal": goal})
+        await client.send_command(
+            "session.send_message", {"session_id": session_id, "content": goal}
+        )
     except IpcError as e:
         print(f"error: {e}", file=sys.stderr)
         loop_task.cancel()

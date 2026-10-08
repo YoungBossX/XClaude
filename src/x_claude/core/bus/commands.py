@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, Discriminator
+from pydantic import BaseModel, Discriminator, Field
 
 from x_claude.core.session.model import SessionMode, SessionStatus
 
@@ -30,7 +30,7 @@ class AgentRunResult(BaseModel):
 class EventSubscribeCommand(BaseModel):
     type: Literal["event.subscribe"] = "event.subscribe"
     topics: list[str]          # fnmatch 模式，如 ["step.*", "tool.*"]
-    scope: str = "global"      # "global" | "run:<run_id>"
+    scope: str = "global"      # "global" | "run:<run_id>" | "session:<session_id>"
     replay_from_run: str | None = None  # 设置则先从 events.jsonl 回放历史再接实时流
 
 
@@ -110,8 +110,10 @@ class SessionClearResult(BaseModel):
 class PermissionRespondCommand(BaseModel):
     type: Literal["permission.respond"] = "permission.respond"
     tool_use_id: str
+    session_id: str
+    run_id: str
     # "allow_once" | "always_allow" | "deny_once" | "always_deny"
-    decision: str
+    decision: Literal["allow_once", "always_allow", "deny_once", "always_deny"]
 
 
 class PermissionRespondResult(BaseModel):
@@ -129,6 +131,33 @@ class SessionCompactResult(BaseModel):
     saved_tokens: int
 
 
+class RecoveredToolResult(BaseModel):
+    content: str
+    is_error: bool = False
+
+
+class SessionRecoverCommand(BaseModel):
+    type: Literal["session.recover"] = "session.recover"
+    session_id: str
+    run_id: str | None = Field(default=None, pattern=r"^[A-Za-z0-9_-]+$")
+    tool_results: dict[str, str | RecoveredToolResult] | None = None
+    accept_config_change: bool = False
+
+
+class BackgroundTaskInfo(BaseModel):
+    run_id: str
+    kind: Literal["background", "root"] = "background"
+    state: str
+    phase: str
+    step: int
+    message: str = ""
+    pending_tools: list[dict[str, Any]] = Field(default_factory=list)
+
+
+class SessionRecoverResult(BaseModel):
+    tasks: list[BackgroundTaskInfo]
+
+
 # 根据 type 字段决定命令类型的判别联合
 Command = Annotated[
     PingCommand
@@ -142,6 +171,7 @@ Command = Annotated[
     | SessionCloseCommand
     | SessionClearCommand
     | PermissionRespondCommand
-    | SessionCompactCommand,
+    | SessionCompactCommand
+    | SessionRecoverCommand,
     Discriminator("type"),
 ]

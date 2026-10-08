@@ -7,6 +7,12 @@ import pytest
 from x_claude.core.tools.builtin.read_file import ReadFileTool
 
 
+# 将临时目录作为测试项目，文件工具不能再绕过真实工作目录边界
+@pytest.fixture(autouse=True)
+def _workspace(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.chdir(tmp_path)
+
+
 # 功能：验证读取存在的文件时返回完整内容且 is_error 为 False
 # 设计：写临时文件后读取，断言 content 和 is_error，覆盖正常路径（happy path）
 async def test_read_existing_file(tmp_path: Path) -> None:

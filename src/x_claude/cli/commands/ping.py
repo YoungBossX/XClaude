@@ -9,6 +9,7 @@ import x_claude
 from x_claude.core.bus.commands import PongResult
 from x_claude.core.bus.envelope import JsonRpcError, JsonRpcSuccess
 from x_claude.core.config import XConfig
+from x_claude.core.transport.auth import read_credential
 
 
 # 同步入口：运行 ping 协程，连接失败时打印错误并退出
@@ -29,6 +30,7 @@ async def _ping(config: XConfig) -> None:
         "jsonrpc": "2.0",
         "id": "cli-1",
         "method": "core.ping",
+        "auth_token": read_credential(config.host, config.port),
         "params": {"client": f"cli/{x_claude.__version__}"},
     }
     writer.write((json.dumps(req) + "\n").encode())

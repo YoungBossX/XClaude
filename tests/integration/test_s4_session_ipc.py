@@ -4,6 +4,8 @@ import asyncio
 import json
 import subprocess
 
+from x_claude.core.transport.auth import read_credential
+
 
 # 发送一条 JSON-RPC 请求并返回响应对象
 async def _send_recv(
@@ -14,6 +16,8 @@ async def _send_recv(
     req_id: str = "1",
 ) -> dict:
     req = {"jsonrpc": "2.0", "id": req_id, "method": method, "params": params}
+    host, port = writer.get_extra_info("peername")[:2]
+    req["auth_token"] = read_credential(host, port)
     writer.write((json.dumps(req) + "\n").encode())
     await writer.drain()
     line = await asyncio.wait_for(reader.readline(), timeout=5.0)

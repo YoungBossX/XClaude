@@ -8,6 +8,12 @@ from x_claude.core.tools.builtin.bash import BashTool
 from x_claude.core.tools.builtin.list_dir import ListDirTool
 from x_claude.core.tools.builtin.write_file import WriteFileTool
 
+
+# 将临时目录作为测试项目，文件工具不能再绕过真实工作目录边界
+@pytest.fixture(autouse=True)
+def _workspace(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.chdir(tmp_path)
+
 # ── bash ──────────────────────────────────────────────────────────────────────
 
 # 功能：验证成功命令的 stdout 出现在 ToolResult.content 中，is_error 为 False
@@ -123,7 +129,7 @@ async def test_list_dir_respects_max_depth(tmp_path: Path) -> None:
 @pytest.mark.asyncio
 async def test_list_dir_missing_path_raises() -> None:
     with pytest.raises(FileNotFoundError):
-        await ListDirTool().invoke({"path": "/this/does/not/exist"})
+        await ListDirTool().invoke({"path": "this/does/not/exist"})
 
 
 # 功能：验证 list_dir 拒绝包含 .. 的路径

@@ -12,6 +12,8 @@ from x_claude.core.bus.commands import (
     AgentRunResult,
     EventSubscribeCommand,
     EventSubscribeResult,
+    PermissionRespondCommand,
+    PermissionRespondResult,
     PingCommand,
     PongResult,
     SessionCloseCommand,
@@ -20,10 +22,12 @@ from x_claude.core.bus.commands import (
     SessionCreateResult,
     SessionGetHistoryCommand,
     SessionGetHistoryResult,
+    SessionRecoverCommand,
+    SessionRecoverResult,
     SessionSendMessageCommand,
     SessionSendMessageResult,
 )
-from x_claude.core.bus.envelope import EventPushEnvelope
+from x_claude.core.bus.envelope import EventPushEnvelope, JsonRpcRequest
 from x_claude.core.bus.events import (
     CoreStartedEvent,
     LlmModelSelectedEvent,
@@ -31,6 +35,7 @@ from x_claude.core.bus.events import (
     LlmUsageEvent,
     LogLineEvent,
     RunFinishedEvent,
+    RunRestoredEvent,
     RunStartedEvent,
     SessionClosedEvent,
     SessionCreatedEvent,
@@ -39,6 +44,9 @@ from x_claude.core.bus.events import (
     SessionWaitingForInputEvent,
     StepFinishedEvent,
     StepStartedEvent,
+    SubagentFinishedEvent,
+    SubagentRestoredEvent,
+    SubagentStartedEvent,
     ToolCallFailedEvent,
     ToolCallFinishedEvent,
     ToolCallStartedEvent,
@@ -150,6 +158,9 @@ def generate() -> str:
             "ts": ts,
         },
     }
+    for request in (ping_req_example, agent_run_req_example, subscribe_req_example,
+                    session_create_req_example, session_send_req_example):
+        request["auth_token"] = "<private local IPC credential>"
 
     sections = [
         "# Wire Protocol\n\n",
@@ -158,8 +169,13 @@ def generate() -> str:
         "- TCP loopback `127.0.0.1:7437` (override via `X_HOST` / `X_PORT`)\n",
         "- Each message is one `\\n`-terminated JSON line (NDJSON)\n",
         "- Commands use JSON-RPC 2.0 (client → server); Events use `kind=event` envelope (server → client)\n\n",
+        "- Non-loopback bind addresses are rejected. Every command requires `auth_token`.\n",
+        "- Daemon generates a private per-endpoint token in `~/.x/ipc/`; local clients read it automatically.\n",
+        "- Token files are owner-only (Windows protected DACL / POSIX 0600). Tokens are not traced.\n",
+        "- Approval replies must match session, run and tool ID and the connection's live subscription.\n\n",
+        _model_section("JsonRpcRequest", JsonRpcRequest),
         "## Commands\n\n",
-        "All commands are sent as JSON-RPC 2.0 requests. The `type` field inside `params` is used for routing.\n\n",
+        "All commands are sent as authenticated JSON-RPC 2.0 requests. `method` selects the handler.\n\n",
         _model_section("PingCommand", PingCommand, ping_req_example),
         "\n",
         _model_section("PongResult", PongResult, pong_resp_example),
@@ -187,6 +203,10 @@ def generate() -> str:
         _model_section("SessionCloseCommand", SessionCloseCommand),
         "\n",
         _model_section("SessionCloseResult", SessionCloseResult),
+        _model_section("SessionRecoverCommand", SessionRecoverCommand),
+        _model_section("SessionRecoverResult", SessionRecoverResult),
+        _model_section("PermissionRespondCommand", PermissionRespondCommand),
+        _model_section("PermissionRespondResult", PermissionRespondResult),
         "\n## Server Push\n\n",
         "Events pushed from daemon to subscribed clients over the same TCP connection.\n\n",
         _model_section("EventPushEnvelope", EventPushEnvelope, event_push_example),
@@ -197,6 +217,8 @@ def generate() -> str:
         "Events written to `runs/<run_id>/events.jsonl` and forwarded over IPC to subscribed clients.\n\n",
         _model_section("RunStartedEvent", RunStartedEvent,
             {"type": "run.started", "run_id": run_id, "goal": "总结 README.md", "ts": ts}),
+        "\n",
+        _model_section("RunRestoredEvent", RunRestoredEvent),
         "\n",
         _model_section("RunFinishedEvent", RunFinishedEvent, {
             "type": "run.finished", "run_id": run_id,
@@ -252,6 +274,12 @@ def generate() -> str:
         "\n",
         _model_section("SessionClosedEvent", SessionClosedEvent,
             {"type": "session.closed", "session_id": session_id, "ts": ts}),
+        "\n## Subagent Events\n\n",
+        _model_section("SubagentStartedEvent", SubagentStartedEvent),
+        "\n",
+        _model_section("SubagentRestoredEvent", SubagentRestoredEvent),
+        "\n",
+        _model_section("SubagentFinishedEvent", SubagentFinishedEvent),
         "\n## Error Codes\n\n",
         "| Code | Name | Meaning |\n",
         "|------|------|---------|\n",

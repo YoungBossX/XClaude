@@ -174,13 +174,15 @@ class PermissionSelect(Static):
         def __init__(self, widget: PermissionSelect, tool_use_id: str, decision: str) -> None:
             self.widget = widget
             self.tool_use_id = tool_use_id
+            self.run_id = widget._run_id
             self.decision = decision
             super().__init__()
 
     # 初始化控件，存储工具 ID（用于 IPC 回复）
-    def __init__(self, tool_use_id: str) -> None:
+    def __init__(self, tool_use_id: str, *, run_id: str = "") -> None:
         super().__init__("")
         self._tool_use_id = tool_use_id
+        self._run_id = run_id
         self._cursor = 0
 
     def on_mount(self) -> None:
@@ -268,10 +270,13 @@ class PermissionBlock(Static):
             super().__init__()
 
     # 初始化审批块，记录工具 ID、名称和参数预览
-    def __init__(self, tool_use_id: str, tool_name: str, param_preview: str) -> None:
+    def __init__(
+        self, tool_use_id: str, tool_name: str, param_preview: str, *, run_id: str = "",
+    ) -> None:
         self._tool_use_id = tool_use_id
         self._tool_name = tool_name
         self._param_preview = param_preview
+        self._run_id = run_id
         self._resolved = False
         super().__init__(self._pending_text(), classes="log-line")
 
@@ -518,7 +523,7 @@ class XTuiApp(App[None]):
         self._client: SocketClient | None = None
         self._current_llm: LLMStreamBlock | None = None
         self._pending_tool_blocks: dict[str, ToolCallBlock] = {}
-        self._pending_permission_blocks: dict[str, PermissionBlock] = {}
+        self._pending_permission_blocks: dict[tuple[str, str], PermissionBlock] = {}
         self._session_id: str | None = None
         self._busy = False
         self._last_context_pct: float = 0.0
@@ -545,6 +550,7 @@ class XTuiApp(App[None]):
             ("exit", "exit TUI"),
             ("clear", "clear current conversation context"),
             ("compact", "compress context window"),
+            ("recover", "核对并恢复后台任务：/recover 查看，带 run_id 确认"),
         ]
         try:
             loader = SkillLoader()
@@ -586,16 +592,19 @@ class XTuiApp(App[None]):
 
     # 用户选中自动补全项后立即执行无参数内置命令，或将 skill 填入输入框等待补充任务
     def on_slash_complete_widget_selected(self, event: SlashCompleteWidget.Selected) -> None:
-        if event.skill_name in {"exit", "clear", "compact"}:
+        if event.skill_name in {"exit", "clear", "compact", "recover"}:
             self._clear_builtin_command_draft()
         if event.skill_name == "exit":
-            self.run_worker(self.action_quit(), name="quit", exclusive=True)
+            self.run_worker(self.action_quit(), name="quit", group="shutdown", exclusive=True)
             return
         if event.skill_name == "clear":
             self.run_worker(self._do_clear(), name="clear", exclusive=False)
             return
         if event.skill_name == "compact":
             self.run_worker(self._do_compact(), name="compact", exclusive=False)
+            return
+        if event.skill_name == "recover":
+            self.run_worker(self._do_recover(), name="recover", group="recovery", exclusive=True)
             return
         prompt = self._prompt()
         if prompt is not None:
@@ -651,7 +660,7 @@ class XTuiApp(App[None]):
         # 检测 /exit 指令，关闭 session 后退出 TUI
         if content == "/exit":
             event.text_area.text = ""
-            self.run_worker(self.action_quit(), name="quit", exclusive=True)
+            self.run_worker(self.action_quit(), name="quit", group="shutdown", exclusive=True)
             return
         # 检测 /clear 指令，创建无历史的新 chat session
         if content == "/clear":
@@ -664,6 +673,14 @@ class XTuiApp(App[None]):
             event.text_area.text = ""
             if self._client is not None and self._session_id is not None and not self._busy:
                 self.run_worker(self._do_compact(), name="compact", exclusive=False)
+            return
+        if content == "/recover" or content.startswith("/recover "):
+            self._clear_builtin_command_draft()
+            if not self._busy:
+                self.run_worker(
+                    self._do_recover(content[8:].strip()), name="recover",
+                    group="recovery", exclusive=True,
+                )
             return
         if self._client is None or self._session_id is None or self._busy:
             self._append(Static("[yellow]agent busy or disconnected[/yellow]", classes="log-line"))
@@ -699,6 +716,36 @@ class XTuiApp(App[None]):
         except (IpcError, RuntimeError, OSError) as e:
             self._append(Static(f"[red]compact error: {e}[/red]", classes="log-line"))
 
+    # 查看后台任务及待核对工具，只有明确输入结果或接受配置时才允许恢复
+    async def _do_recover(self, arguments: str = "") -> None:
+        if self._client is None or self._session_id is None:
+            return
+        params: dict[str, Any] = {"session_id": self._session_id}
+        try:
+            if arguments:
+                parts = arguments.split(None, 1)
+                params["run_id"] = parts[0]
+                tail = parts[1].strip() if len(parts) > 1 else ""
+                if tail.startswith("--accept-config"):
+                    params["accept_config_change"] = True
+                    tail = tail[len("--accept-config"):].strip()
+                if tail:
+                    params["tool_results"] = json.loads(tail)
+            result = await self._client.send_command("session.recover", params)
+            tasks = result.get("tasks", [])
+            self._append(Static(
+                "后台恢复状态\n" + json.dumps(tasks, ensure_ascii=False, indent=2),
+                markup=False, classes="log-line",
+            ))
+            self._append(Static(
+                '/recover <run_id> {"工具调用id":"核对后的实际结果"}\n'
+                '失败或未执行可填 {"工具调用id":{"content":"原因","is_error":true}}\n'
+                '配置变化需核对后加 --accept-config（放在 JSON 前）；不会自动重放工具。',
+                markup=False, classes="log-line",
+            ))
+        except (IpcError, RuntimeError, OSError, ValueError) as exc:
+            self._append(Static(f"recover error: {exc}", markup=False, classes="log-line"))
+
     # 创建无历史的新 session 并清空 TUI 对话输出
     async def _do_clear(self) -> None:
         if self._client is None or self._session_id is None:
@@ -710,6 +757,8 @@ class XTuiApp(App[None]):
             self._append(Static(f"[red]clear error: {e}[/red]", classes="log-line"))
             return
         self._session_id = str(result["session_id"])
+        self._resume_session_id = self._session_id
+        await self._subscribe_session()
         self._break_llm()
         log_view = self.query_one("#log-view", VerticalScroll)
         await log_view.remove_children()
@@ -739,21 +788,28 @@ class XTuiApp(App[None]):
     # 处理内联审批控件的用户决策：发送 IPC 响应并恢复输入框
     async def on_permission_select_decided(self, msg: PermissionSelect.Decided) -> None:
         tool_use_id = msg.tool_use_id
+        key = (msg.run_id, tool_use_id)
         decision = msg.decision
         log.info("permission decided tool_use_id=%s decision=%s", tool_use_id, decision)
         try:
+            perm_block = self._pending_permission_blocks.get(key)
+            if self._client is not None and perm_block is not None:
+                try:
+                    response = await self._client.send_command(
+                        "permission.respond",
+                        {"tool_use_id": tool_use_id, "decision": decision,
+                         "session_id": self._session_id, "run_id": perm_block._run_id},
+                    )
+                    if not response.get("ok", False):
+                        self.notify("审批已过期或不属于当前连接", severity="warning")
+                        return
+                except (IpcError, RuntimeError, OSError) as exc:
+                    self.notify(f"审批发送失败：{exc}", severity="error")
+                    return
             msg.widget.remove()
-            perm_block = self._pending_permission_blocks.pop(tool_use_id, None)
+            perm_block = self._pending_permission_blocks.pop(key, None)
             if perm_block is not None:
                 perm_block._resolve(decision)
-            if self._client is not None:
-                try:
-                    await self._client.send_command(
-                        "permission.respond",
-                        {"tool_use_id": tool_use_id, "decision": decision},
-                    )
-                except (IpcError, RuntimeError, OSError):
-                    pass
             if not self._pending_permission_blocks:
                 p = self._prompt()
                 if p is not None:
@@ -818,7 +874,21 @@ class XTuiApp(App[None]):
             f"{session}  [{color}]{state}[/{color}]"
         )
 
-    # 管理 SocketClient 生命周期：连接、订阅事件、断线重连
+    # 将实时事件限定到当前会话；回放模式只接收指定运行树
+    async def _subscribe_session(self) -> None:
+        if self._client is None or self._session_id is None:
+            return
+        params: dict[str, Any] = {
+            "topics": ["session.*", "run.*", "step.*", "tool.*", "llm.*", "log.*",
+                       "permission.*", "context.*", "subagent.*", "skill.*"],
+            "scope": f"session:{self._session_id}",
+        }
+        if self._replay_run_id is not None:
+            params["scope"] = f"run:{self._replay_run_id}"
+            params["replay_from_run"] = self._replay_run_id
+        await self._client.send_command("event.subscribe", params)
+
+    # 管理 SocketClient 生命周期：连接、会话订阅、断线重连
     async def _socket_loop(self) -> None:
         header = self.query_one("#header", Label)
 
@@ -849,25 +919,6 @@ class XTuiApp(App[None]):
                     if not t.cancelled() and t.exception() is not None
                     else None
                 )
-                params: dict[str, Any] = {
-                    "topics": [
-                        "session.*",
-                        "run.*",
-                        "step.*",
-                        "tool.*",
-                        "llm.token",
-                        "llm.usage",
-                        "log.*",
-                        "permission.*",
-                        "context.*",
-                        "subagent.*",
-                        "skill.*",
-                    ],
-                    "scope": "global",
-                }
-                if self._replay_run_id is not None:
-                    params["replay_from_run"] = self._replay_run_id
-                await client.send_command("event.subscribe", params)
                 if self._resume_session_id is not None:
                     resumed = await client.send_command(
                         "session.resume", {"session_id": self._resume_session_id}
@@ -882,13 +933,16 @@ class XTuiApp(App[None]):
                     created = await client.send_command("session.create", {"mode": "chat"})
                     self._session_id = str(created["session_id"])
                     log.info("session created session_id=%s", self._session_id)
+                # 断线重连必须恢复当前会话，不能新建会话而遗失后台任务索引
+                self._resume_session_id = self._session_id
+                await self._subscribe_session()
                 prompt = self._prompt()
                 if prompt is not None:
-                    prompt.disabled = False
+                    prompt.disabled = self._busy
                     prompt.read_only = False
                     prompt.border_title = "type a message — enter to send, ⌘/⇧/⌥+enter for newline"
                     prompt.focus()
-                self._update_header("ready")
+                self._update_header("running" if self._busy else "ready")
                 await loop_task
             except IpcError as e:
                 header.update(f"[bold]XClaude[/bold]  [red]subscribe error: {e}[/red]")
@@ -910,6 +964,9 @@ class XTuiApp(App[None]):
 
     # 根据事件 type 路由到对应渲染逻辑；捕获异常防止 socket loop 因单个事件崩溃
     def _handle_event(self, event: dict[str, Any]) -> None:
+        if (self._replay_run_id is None and self._session_id is not None
+                and event.get("session_id") not in (None, "", self._session_id)):
+            return
         try:
             self._handle_event_inner(event)
         except Exception:
@@ -952,9 +1009,21 @@ class XTuiApp(App[None]):
         elif t == "run.started":
             run_id = event.get("run_id", "")
             goal = event.get("goal", "")
+            label = "主任务续跑" if event.get("resumed") else "run"
             self._append(Static(
-                f"[dim]run[/dim]  [cyan]{run_id}[/cyan]  [dim]{_preview(goal, 96)}[/dim]",
+                f"[dim]{label}[/dim]  [cyan]{run_id}[/cyan]  [dim]{_preview(goal, 96)}[/dim]",
                 classes="run-header",
+            ))
+
+        elif t == "run.restored":
+            self._busy = event.get("state") == "running"
+            prompt = self._prompt()
+            if prompt is not None:
+                prompt.disabled = self._busy
+            self._update_header("running" if self._busy else "ready")
+            self._append(Static(
+                f"主任务恢复 · {event.get('run_id', '')} · step {event.get('step', 0)}\n"
+                + event.get("message", ""), markup=False, classes="log-line",
             ))
 
         elif t == "skill.invoked":
@@ -973,10 +1042,29 @@ class XTuiApp(App[None]):
             self._subagent_run_ids[run_id] = description
             self._subagent_start_times[run_id] = time.monotonic()
             short_id = run_id[:8] if len(run_id) >= 8 else run_id
+            resume_label = "[yellow]续跑[/yellow] " if event.get("resumed") else ""
             self._append(Static(
-                f"[dim]┌─[/dim] [cyan]{_preview(description, 72)}[/cyan]  [dim]{short_id}[/dim]",
+                f"[dim]┌─[/dim] {resume_label}[cyan]{_preview(description, 72)}[/cyan] "
+                f"[dim]{short_id}[/dim]",
                 classes="log-line",
             ))
+
+        elif t == "subagent.restored":
+            description = _preview(event.get("description", ""), 72)
+            message = _preview(event.get("message", ""), 240)
+            color = "yellow" if event.get("state") == "blocked" else "cyan"
+            if event.get("state") != "running":
+                self._subagent_run_ids.pop(event.get("run_id", ""), None)
+                self._subagent_start_times.pop(event.get("run_id", ""), None)
+            self._append(Static(
+                f"[{color}]后台任务恢复 · {description} · step {event.get('step', 0)}[/{color}] "
+                f"[dim]{message}[/dim]", classes="log-line",
+            ))
+            if event.get("state") == "blocked":
+                self._append(Static(
+                    f"任务 {event.get('run_id', '')} 等待核对，输入 /recover 查看详情。",
+                    markup=False, classes="log-line",
+                ))
 
         elif t == "subagent.finished":
             run_id = event.get("run_id", "")
@@ -1042,6 +1130,11 @@ class XTuiApp(App[None]):
                     f"[bold green]✓ completed[/bold green]  [dim]{steps} steps[/dim]",
                     classes="run-ok",
                 ))
+            elif status == "suspended":
+                self._append(Static(
+                    f"[yellow]主任务已挂起，恢复会话后续跑[/yellow]  {steps} steps",
+                    classes="log-line",
+                ))
             else:
                 detail = f"  [dim]{reason}[/dim]" if reason else ""
                 self._append(Static(
@@ -1077,6 +1170,14 @@ class XTuiApp(App[None]):
 
         elif t == "permission.requested":
             tool_use_id = str(event.get("tool_use_id", ""))
+            run_id = str(event.get("run_id", ""))
+            key = (run_id, tool_use_id)
+            old = self._pending_permission_blocks.pop(key, None)
+            if old is not None:
+                old.remove()
+                for select in self.query(PermissionSelect):
+                    if (select._run_id, select._tool_use_id) == key:
+                        select.remove()
             tool_name = str(event.get("tool_name", ""))
             param_preview = str(event.get("param_preview", ""))
             try:
@@ -1087,27 +1188,31 @@ class XTuiApp(App[None]):
                 "permission.requested tool=%s id=%s  app.focused=%s",
                 tool_name, tool_use_id, _focused_repr,
             )
-            perm_block = PermissionBlock(tool_use_id, tool_name, param_preview)
-            self._pending_permission_blocks[tool_use_id] = perm_block
+            perm_block = PermissionBlock(
+                tool_use_id, tool_name, param_preview, run_id=str(event.get("run_id", "")),
+            )
+            self._pending_permission_blocks[key] = perm_block
             prompt = self._prompt()
             if prompt is not None:
                 prompt.disabled = True
                 prompt.border_title = "permission required"
             self._append(perm_block)
-            select = PermissionSelect(tool_use_id)
+            select = PermissionSelect(tool_use_id, run_id=run_id)
             self._mount_permission_select(select)
             log.debug("PermissionSelect mounted before #prompt  pending=%d", len(self._pending_permission_blocks))
 
-        elif t == "permission.denied":
+        elif t in ("permission.denied", "permission.granted"):
             # 处理超时或断连等非用户交互触发的 deny（用户主动 deny 已由 on_permission_select_decided 处理）
             tool_use_id = str(event.get("tool_use_id", ""))
+            key = (str(event.get("run_id", "")), tool_use_id)
             decision = str(event.get("decision", "denied"))
-            if tool_use_id in self._pending_permission_blocks:
-                perm_block = self._pending_permission_blocks.pop(tool_use_id)
+            if key in self._pending_permission_blocks:
+                perm_block = self._pending_permission_blocks.pop(key)
                 perm_block._resolve(decision)
                 try:
-                    select = self.query_one(PermissionSelect)
-                    select.remove()
+                    for select in self.query(PermissionSelect):
+                        if (select._run_id, select._tool_use_id) == key:
+                            select.remove()
                 except Exception:
                     pass
                 if not self._pending_permission_blocks:

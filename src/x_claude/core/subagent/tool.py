@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import logging
+from collections.abc import Callable, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -8,12 +10,24 @@ from typing import TYPE_CHECKING, Any
 from pydantic import BaseModel, ConfigDict
 
 from x_claude.core.agents.loader import AgentProfile, AgentProfileLoader
-from x_claude.core.bus.events import SubagentFinishedEvent, SubagentStartedEvent
+from x_claude.core.bus.events import (
+    SubagentFinishedEvent,
+    SubagentRestoredEvent,
+    SubagentStartedEvent,
+)
+from x_claude.core.compact.compactor import Compactor
+from x_claude.core.config import XConfig
 from x_claude.core.context import ExecutionContext
 from x_claude.core.events.bus import EventBus
 from x_claude.core.events.writer import EventWriter
 from x_claude.core.loop import AgentLoop
 from x_claude.core.runs import new_run_id
+from x_claude.core.subagent.checkpoint import (
+    BackgroundCheckpoint,
+    BackgroundRecord,
+    ContextSnapshot,
+    runtime_signature,
+)
 from x_claude.core.subagent.registry import BackgroundTaskRegistry
 from x_claude.core.tools.base import BaseTool, ToolResult
 from x_claude.core.tools.builtin.bash import BashTool
@@ -84,7 +98,7 @@ class SpawnAgentTool(BaseTool):
     # 构造 SpawnAgentTool；depth=0 表示根 agent，最大允许嵌套深度为 2
     def __init__(
         self,
-        provider: LLMProvider,
+        provider: LLMProvider | None,
         parent_bus: EventBus,
         parent_run_id: str,
         permission_manager: PermissionManager | None,
@@ -93,6 +107,8 @@ class SpawnAgentTool(BaseTool):
         runs_dir: Path,
         session_id: str,
         depth: int = 0,
+        config: XConfig | None = None,
+        mcp_tools: Sequence[BaseTool] | None = None,
     ) -> None:
         self._provider = provider
         self._parent_bus = parent_bus
@@ -103,6 +119,8 @@ class SpawnAgentTool(BaseTool):
         self._runs_dir = runs_dir
         self._session_id = session_id
         self._depth = depth
+        self._config = config or XConfig()
+        self._mcp_tools = list(mcp_tools or [])
 
     # 派生子 agent，前台时阻塞直到完成并返回结果，后台时立即返回 run_id
     async def invoke(self, params: dict[str, object]) -> ToolResult:
@@ -136,12 +154,37 @@ class SpawnAgentTool(BaseTool):
         child_bus.subscribe(_bridge)
 
         child_registry = self._build_child_registry(child_bus, child_run_id, profile)
+        child_run_path = self._runs_dir / child_run_id
+        child_run_path.mkdir(parents=True, exist_ok=True)
+        checkpoint = None
+        if p.run_in_background:
+            checkpoint = BackgroundCheckpoint(child_run_path / "background.json", BackgroundRecord(
+                run_id=child_run_id, parent_run_id=self._parent_run_id,
+                session_id=self._session_id, description=p.description,
+                cwd=str(Path.cwd().resolve()), depth=self._depth,
+                tools=[str(schema["name"]) for schema in child_registry.tool_schemas()],
+                runtime_signature=runtime_signature(self._config, child_registry.tool_schemas()),
+                model=self._config.llm.default_model,
+                context=ContextSnapshot.capture(child_context),
+            ))
+            checkpoint.save(child_context, "ready")
+        assert self._provider is not None
         child_loop = AgentLoop(
             self._provider,
             child_registry,
             child_bus,
             permission_manager=self._permission_manager,
             session_id=self._session_id,
+            compactor=Compactor(
+                child_bus, child_run_path, self._session_id,
+                tool_result_limit=self._config.compaction.tool_result_limit,
+                tool_result_keep=self._config.compaction.tool_result_keep,
+            ),
+            compact_threshold=self._config.compaction.auto_threshold,
+            tool_result_limit=self._config.compaction.tool_result_limit,
+            tool_result_keep=self._config.compaction.tool_result_keep,
+            context_window=self._config.llm.context_window or 200_000,
+            checkpoint=checkpoint.save if checkpoint is not None else None,
         )
 
         await self._parent_bus.publish(
@@ -149,17 +192,16 @@ class SpawnAgentTool(BaseTool):
                 run_id=child_run_id,
                 parent_run_id=self._parent_run_id,
                 description=p.description,
+                session_id=self._session_id,
                 ts=_now(),
             )
         )
 
-        child_run_path = self._runs_dir / child_run_id
-        child_run_path.mkdir(parents=True, exist_ok=True)
-
         if p.run_in_background:
             task: asyncio.Task[None] = asyncio.create_task(
                 self._run_background(
-                    child_loop, child_context, child_bus, child_run_path, child_run_id
+                    child_loop, child_context, child_bus, child_run_path, child_run_id,
+                    checkpoint=checkpoint,
                 )
             )
             self._task_registry.register(child_run_id, task, child_context)
@@ -170,17 +212,8 @@ class SpawnAgentTool(BaseTool):
                 )
             )
 
-        async with EventWriter(child_run_path / "events.jsonl") as writer:
-            writer.subscribe(child_bus)
-            await child_loop.run(child_context)
-
-        await self._parent_bus.publish(
-            SubagentFinishedEvent(
-                run_id=child_run_id,
-                parent_run_id=self._parent_run_id,
-                status=child_context.status,
-                ts=_now(),
-            )
+        await self._run_background(
+            child_loop, child_context, child_bus, child_run_path, child_run_id,
         )
 
         if child_context.status == "success":
@@ -204,18 +237,128 @@ class SpawnAgentTool(BaseTool):
         bus: EventBus,
         run_path: Path,
         run_id: str,
+        *, checkpoint: BackgroundCheckpoint | None = None,
+        start_gate: asyncio.Event | None = None,
     ) -> None:
+        if start_gate is not None:
+            await start_gate.wait()
         async with EventWriter(run_path / "events.jsonl") as writer:
             writer.subscribe(bus)
-            await loop.run(context)
-        await self._parent_bus.publish(
-            SubagentFinishedEvent(
-                run_id=run_id,
-                parent_run_id=self._parent_run_id,
-                status=context.status,
-                ts=_now(),
-            )
+            try:
+                await loop.run(context)
+                if checkpoint is not None:
+                    checkpoint.save(context, "finished")
+            except asyncio.CancelledError:
+                suspend = self._task_registry.suspending
+                context.mark_failed("suspended" if suspend else "cancelled")
+                if checkpoint is not None:
+                    checkpoint.interrupt(suspend=suspend)
+                raise
+            except Exception:
+                context.mark_failed("subagent_error")
+                logging.getLogger(__name__).exception("subagent failed run_id=%s", run_id)
+                if checkpoint is not None:
+                    try:
+                        checkpoint.save(context, "finished")
+                    except Exception:
+                        logging.getLogger(__name__).exception("checkpoint failed run_id=%s", run_id)
+            finally:
+                await bus.publish(SubagentFinishedEvent(
+                    run_id=run_id, parent_run_id=self._parent_run_id,
+                    status="suspended" if context.reason == "suspended" else context.status,
+                    session_id=self._session_id, ts=_now(),
+                ), isolate_errors=True)
+
+    # 从安全检查点续跑；工具阶段不自动重放，已完成或取消的结果只重建查询索引
+    async def restore(
+        self, checkpoint: BackgroundCheckpoint,
+        *, provider_factory: Callable[[], LLMProvider],
+        start_gate: asyncio.Event | None = None,
+    ) -> None:
+        record = checkpoint.record
+        context = record.context.restore(record.run_id)
+        message = "已恢复保存的任务结果"
+        terminal = record.state in ("completed", "cancelled") or context.is_done()
+        blocked = ""
+        child_bus = EventBus()
+        registry = self._build_child_registry(
+            child_bus, record.run_id, None, allowed_tools=record.tools,
         )
+        signature = runtime_signature(self._config, registry.tool_schemas())
+        if not terminal and record.phase == "tools" and checkpoint.pending_tools():
+            blocked = (
+                "interrupted_tool: 工具结果尚未确认，请核对文件、Shell 或 MCP 操作；不会自动重放"
+            )
+        elif not terminal and Path(record.cwd).resolve() != Path.cwd().resolve():
+            blocked = f"workspace_mismatch: 请在原工作目录恢复会话：{record.cwd}"
+        elif not terminal and record.runtime_signature != signature:
+            blocked = (
+                "config_changed: 模型、窗口、服务地址或工具契约变化（旧模型："
+                + (record.model or "未记录") + "），请用 /recover 核对并明确接受当前配置"
+            )
+        if blocked:
+            context.mark_failed("needs_review: " + blocked)
+            message = blocked
+        if terminal or blocked:
+            future: asyncio.Future[None] = asyncio.get_running_loop().create_future()
+            future.set_result(None)
+            self._task_registry.register(record.run_id, future, context)
+            state = "blocked" if blocked else record.state
+        else:
+            if record.phase == "tools":
+                checkpoint.save(context, "ready")
+            try:
+                if self._provider is None:
+                    self._provider = provider_factory()
+            except (Exception, SystemExit) as exc:
+                context.mark_failed(f"recovery_provider_error: {exc}")
+                future = asyncio.get_running_loop().create_future()
+                future.set_result(None)
+                self._task_registry.register(record.run_id, future, context)
+                await self._parent_bus.publish(SubagentRestoredEvent(
+                    run_id=record.run_id, session_id=self._session_id,
+                    parent_run_id=record.parent_run_id, description=record.description,
+                    state="blocked", step=context.step, message=context.reason or "", ts=_now(),
+                ), isolate_errors=True)
+                return
+            context.status = "running"
+            context.reason = None
+
+            # 续跑事件只桥接到该会话的 daemon 总线，显式携带会话身份
+            async def bridge(event: BaseModel) -> None:
+                await self._parent_bus.publish(event, isolate_errors=True)
+
+            child_bus.subscribe(bridge)
+            loop = AgentLoop(
+                self._provider, registry, child_bus,
+                permission_manager=self._permission_manager, session_id=self._session_id,
+                compactor=Compactor(
+                    child_bus, checkpoint.path.parent, self._session_id,
+                    tool_result_limit=self._config.compaction.tool_result_limit,
+                    tool_result_keep=self._config.compaction.tool_result_keep,
+                ),
+                compact_threshold=self._config.compaction.auto_threshold,
+                tool_result_limit=self._config.compaction.tool_result_limit,
+                tool_result_keep=self._config.compaction.tool_result_keep,
+                context_window=self._config.llm.context_window or 200_000,
+                checkpoint=checkpoint.save,
+            )
+            await self._parent_bus.publish(SubagentStartedEvent(
+                run_id=record.run_id, parent_run_id=record.parent_run_id,
+                description=record.description, session_id=self._session_id,
+                resumed=True, ts=_now(),
+            ), isolate_errors=True)
+            task = asyncio.create_task(self._run_background(
+                loop, context, child_bus, checkpoint.path.parent, record.run_id,
+                checkpoint=checkpoint, start_gate=start_gate,
+            ))
+            self._task_registry.register(record.run_id, task, context)
+            state, message = "running", "从最后已确认步骤续跑，不重放已完成工具"
+        await self._parent_bus.publish(SubagentRestoredEvent(
+            run_id=record.run_id, session_id=self._session_id,
+            parent_run_id=record.parent_run_id, description=record.description,
+            state=state, step=context.step, message=message, ts=_now(),
+        ), isolate_errors=True)
 
     # 构造子 registry；基于角色配置过滤工具，深度允许时注册嵌套 SpawnAgentTool
     def _build_child_registry(
@@ -223,10 +366,11 @@ class SpawnAgentTool(BaseTool):
         child_bus: EventBus,
         child_run_id: str,
         profile: AgentProfile | None,
+        *, allowed_tools: list[str] | None = None,
     ) -> ToolRegistry:
         from x_claude.core.task.manager import TaskManager
 
-        allowed: set[str] | None = (
+        allowed: set[str] | None = set(allowed_tools) if allowed_tools is not None else (
             set(profile.allowed_tools) if profile and profile.allowed_tools else None
         )
 
@@ -243,6 +387,9 @@ class SpawnAgentTool(BaseTool):
         for t in _all_tools:
             if _allowed(t.name):
                 registry.register(t)
+        for tool in self._mcp_tools:
+            if _allowed(tool.name):
+                registry.register(tool)
 
         child_task_manager = TaskManager(self._runs_dir / child_run_id / ".tasks")
         for t in [
@@ -265,6 +412,8 @@ class SpawnAgentTool(BaseTool):
                 runs_dir=self._runs_dir,
                 session_id=self._session_id,
                 depth=self._depth + 1,
+                config=self._config,
+                mcp_tools=self._mcp_tools,
             )
             if _allowed("spawn_agent"):
                 registry.register(nested)
@@ -324,5 +473,10 @@ class AgentResultTool(BaseTool):
                 content=f"Subagent raised an exception: {exc}",
                 is_error=True,
                 error_type="runtime_error",
+            )
+        if context.status != "success":
+            return ToolResult(
+                content=f"Subagent failed: {context.reason or context.status}",
+                is_error=True, error_type="runtime_error",
             )
         return ToolResult(content=context.result or "Subagent completed with no text result.")

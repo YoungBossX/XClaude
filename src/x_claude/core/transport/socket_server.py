@@ -3,9 +3,11 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import secrets
 from collections.abc import Awaitable, Callable
 from contextvars import ContextVar
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any
 
 from pydantic import BaseModel, ValidationError
@@ -15,6 +17,7 @@ from x_claude.core.bus.envelope import (
     INVALID_REQUEST,
     METHOD_NOT_FOUND,
     PARSE_ERROR,
+    UNAUTHORIZED,
     HandlerError,
     JsonRpcError,
     JsonRpcRequest,
@@ -23,6 +26,7 @@ from x_claude.core.bus.envelope import (
 )
 from x_claude.core.trace.record import TraceRecord
 from x_claude.core.trace.writer import TraceWriter
+from x_claude.core.transport.auth import local_host, publish_credential
 from x_claude.core.transport.ipc_broadcaster import IpcEventBroadcaster
 
 logger = logging.getLogger(__name__)
@@ -59,6 +63,10 @@ class SocketServer:
         self._broadcaster = broadcaster
         self._trace = trace
         self._active_writers: set[asyncio.StreamWriter] = set()
+        self._requests: set[asyncio.Task[None]] = set()
+        self._auth_token: str | None = None
+        self._credential_path: Path | None = None
+        self._stopping = False
 
     # 注册一个方法名对应的命令处理函数
     def register(self, method: str, handler: CommandHandler) -> None:
@@ -66,6 +74,7 @@ class SocketServer:
 
     # 启动 TCP 服务器；若端口已被占用则退出进程
     async def start(self) -> str:
+        self._host = local_host(self._host)
         try:
             _r, w = await asyncio.open_connection(self._host, self._port)
             w.close()
@@ -80,22 +89,48 @@ class SocketServer:
             port=self._port,
             limit=_MAX_LINE_BYTES,
         )
+        port = self._server.sockets[0].getsockname()[1]
+        self._auth_token = secrets.token_urlsafe(32)
+        try:
+            self._credential_path = publish_credential(self._host, port, self._auth_token)
+        except BaseException:
+            self._server.close()
+            await self._server.wait_closed()
+            raise
         return f"{self._host}:{self._port}"
+
+    # 先停止接收新连接与新命令，不取消现有主任务，让 manager 先设置挂起状态
+    def stop_accepting(self) -> None:
+        self._stopping = True
+        if self._server is not None:
+            self._server.close()
 
     # 关闭服务器：先断开所有活跃连接，再等待服务器完全关闭（最多 2 秒）
     async def stop(self) -> None:
         if self._server is None:
             return
+        self.stop_accepting()
         for writer in list(self._active_writers):
             try:
                 writer.close()
             except Exception:
                 pass
         self._server.close()
+        requests = [task for task in self._requests if task is not asyncio.current_task()]
+        for task in requests:
+            task.cancel()
+        if requests:
+            await asyncio.gather(*requests, return_exceptions=True)
         try:
             await asyncio.wait_for(self._server.wait_closed(), timeout=2.0)
         except (TimeoutError, asyncio.CancelledError):
             pass
+        if self._credential_path is not None:
+            try:
+                if self._credential_path.read_text(encoding="ascii") == self._auth_token:
+                    self._credential_path.unlink()
+            except FileNotFoundError:
+                pass
 
     # 处理单个客户端连接，完成后关闭写流
     async def _handle_connection(
@@ -108,6 +143,8 @@ class SocketServer:
         self._active_writers.add(writer)
         try:
             await self._read_loop(reader, writer)
+        except (ConnectionResetError, BrokenPipeError, OSError):
+            logger.debug("client connection reset: %s", peer)
         finally:
             self._active_writers.discard(writer)
             if self._broadcaster is not None:
@@ -127,7 +164,7 @@ class SocketServer:
         while True:
             try:
                 line = await reader.readline()
-            except asyncio.LimitOverrunError:
+            except (asyncio.LimitOverrunError, ValueError):
                 await self._send(writer, make_error(None, INVALID_REQUEST, "Request too large"))
                 return
 
@@ -136,7 +173,9 @@ class SocketServer:
 
             # 每条命令独立作为 task 执行，避免长时间运行的 handler（如 session.send_message）
             # 阻塞读循环，使 permission.respond 等并发命令能被及时处理
-            asyncio.create_task(self._handle_line(line, writer))
+            task = asyncio.create_task(self._handle_line(line, writer))
+            self._requests.add(task)
+            task.add_done_callback(self._requests.discard)
 
     # 解析单行 JSON-RPC 请求并调用对应 handler，将结果或错误写回客户端
     async def _handle_line(self, line: bytes, writer: asyncio.StreamWriter) -> None:
@@ -148,8 +187,18 @@ class SocketServer:
 
         try:
             req = JsonRpcRequest.model_validate(raw)
-        except ValidationError as e:
-            await self._send(writer, make_error(None, INVALID_REQUEST, "Invalid Request", str(e)))
+        except ValidationError:
+            await self._send(writer, make_error(None, INVALID_REQUEST, "Invalid Request"))
+            return
+
+        if (self._auth_token is None or req.auth_token is None
+                or not secrets.compare_digest(req.auth_token.encode(), self._auth_token.encode())):
+            await self._send(
+                writer, make_error(req.id, UNAUTHORIZED, "IPC authentication required"),
+            )
+            return
+        if self._stopping:
+            await self._send(writer, make_error(req.id, INTERNAL_ERROR, "daemon is shutting down"))
             return
 
         if self._trace is not None:

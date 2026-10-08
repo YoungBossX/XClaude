@@ -63,7 +63,7 @@ def test_slash_completion_selecting_exit_starts_safe_quit() -> None:
     try:
         app.on_slash_complete_widget_selected(SlashCompleteWidget.Selected("exit"))
         assert len(workers) == 1
-        assert workers[0][1] == {"name": "quit", "exclusive": True}
+        assert workers[0][1] == {"name": "quit", "group": "shutdown", "exclusive": True}
         assert prompt.text == ""
     finally:
         for coroutine, _ in workers:
@@ -292,7 +292,7 @@ async def test_exit_command_starts_safe_quit_without_sending_message() -> None:
     try:
         await app.on_chat_text_area_submitted(_FakeEvent(_FakeArea()))  # type: ignore[arg-type]
         assert len(workers) == 1
-        assert workers[0][1] == {"name": "quit", "exclusive": True}
+        assert workers[0][1] == {"name": "quit", "group": "shutdown", "exclusive": True}
         assert appended == []
     finally:
         for coroutine, _ in workers:

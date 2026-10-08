@@ -34,6 +34,8 @@ from x_claude.core.bus.commands import (
     SessionCreateResult,
     SessionGetHistoryCommand,
     SessionGetHistoryResult,
+    SessionRecoverCommand,
+    SessionRecoverResult,
     SessionResumeCommand,
     SessionResumeResult,
     SessionSendMessageCommand,
@@ -171,9 +173,15 @@ class CoreApp:
         )
         if self._permission_manager is None:
             logger.error("permission.respond: PermissionManager not initialized")
-            return PermissionRespondResult()
-        self._permission_manager.respond(cmd.tool_use_id, cmd.decision)
-        return PermissionRespondResult()
+            return PermissionRespondResult(ok=False)
+        if self._broadcaster is None or not self._broadcaster.can_approve(
+            get_connection_writer(), cmd.session_id, cmd.run_id, cmd.tool_use_id,
+        ):
+            return PermissionRespondResult(ok=False)
+        accepted = self._permission_manager.respond(
+            cmd.tool_use_id, cmd.decision, session_id=cmd.session_id, run_id=cmd.run_id,
+        )
+        return PermissionRespondResult(ok=accepted)
 
     # 手动压缩 session thread，将摘要持久化写入 thread.jsonl
     async def _session_compact_handler(self, params: dict[str, Any]) -> SessionCompactResult:
@@ -196,19 +204,37 @@ class CoreApp:
         session = await self._sessions.clear_context(cmd.session_id)
         return SessionClearResult(session_id=session.id, status=session.status)
 
+    # 显示后台任务恢复状态，或接收用户核对的工具结果及配置变更确认
+    async def _session_recover_handler(self, params: dict[str, Any]) -> SessionRecoverResult:
+        assert self._sessions is not None
+        return await self._sessions.recover(SessionRecoverCommand.model_validate(params))
+
     # 注册客户端事件订阅，可选先回放 events.jsonl 历史再接收实时流
     async def _subscribe_handler(self, params: dict[str, Any]) -> EventSubscribeResult:
         cmd = EventSubscribeCommand.model_validate(params)
         writer = get_connection_writer()
 
-        replayed_count = 0
-        if cmd.replay_from_run is not None:
-            replayed_count = await self._replay_events(
-                cmd.replay_from_run, writer, cmd.topics
-            )
-
         assert self._broadcaster is not None
-        sub_id = self._broadcaster.subscribe(writer, cmd.topics, cmd.scope)
+        replayed_count = 0
+        sub_id = self._broadcaster.subscribe(
+            writer, cmd.topics, cmd.scope, replaying=cmd.replay_from_run is not None,
+        )
+        try:
+            if cmd.replay_from_run is not None:
+                replayed_ids: set[str] = set()
+                replayed_count = await self._replay_events(
+                    cmd.replay_from_run, writer, cmd.topics, scope=cmd.scope,
+                    replayed_ids=replayed_ids,
+                )
+                await self._broadcaster.finish_replay(writer, replayed_ids)
+            if self._permission_manager is not None:
+                for event in self._permission_manager.pending_events():
+                    await self._broadcaster.send_pending_permission(writer, event)
+        except BaseException:
+            self._broadcaster.unsubscribe(writer)
+            raise
+        if cmd.scope.startswith("session:") and self._sessions is not None:
+            await self._sessions.recover_background(cmd.scope[8:])
         return EventSubscribeResult(subscription_id=sub_id, replayed_count=replayed_count)
 
     # 从 events.jsonl 向 writer 回放匹配 topic 的历史事件，返回已回放条数
@@ -217,6 +243,7 @@ class CoreApp:
         run_id: str,
         writer: asyncio.StreamWriter,
         topics: list[str],
+        *, scope: str = "global", replayed_ids: set[str] | None = None,
     ) -> int:
         path = events_file(run_id)
         if not path.exists():
@@ -229,22 +256,31 @@ class CoreApp:
             return 0
 
         count = 0
-        for line in path.read_text().splitlines():
+        for line in path.read_text(encoding="utf-8").splitlines():
             if not line:
                 continue
             try:
                 event = json.loads(line)
             except json.JSONDecodeError:
                 continue
+            if scope.startswith("session:") and path.parent.parent.name == "runs":
+                event["session_id"] = event.get("session_id") or path.parent.parent.parent.name
+            if self._broadcaster is not None:
+                event = self._broadcaster.associate(event)
+                if not self._broadcaster.matches_scope(event, scope):
+                    continue
+            # 即使未订阅 started 事件，也必须先建立父子关系以过滤后续 token
             event_type: str = event.get("type", "")
             if not any(fnmatch.fnmatch(event_type, p) for p in topics):
                 continue
             envelope = EventPushEnvelope(event=event)
             writer.write(envelope.model_dump_json().encode() + b"\n")
+            if replayed_ids is not None and event.get("event_id"):
+                replayed_ids.add(event["event_id"])
             count += 1
 
         if count:
-            await writer.drain()
+            await asyncio.wait_for(writer.drain(), timeout=2.0)
         return count
 
     # 启动守护进程：加载配置、初始化日志、启动 trace、启动 TCP 服务器，并等待退出信号
@@ -275,7 +311,9 @@ class CoreApp:
         sessions_root = Path("~/.x/sessions").expanduser()
         store = SessionStore(sessions_root)
         assert self._config is not None
-        compact_provider = AnthropicProvider(self._config.llm.default_model)
+        compact_provider = AnthropicProvider(
+            self._config.llm.default_model, context_window=self._config.llm.context_window,
+        )
 
         self._mcp_manager = McpServerManager()
         if self._config.mcp.servers:
@@ -293,6 +331,7 @@ class CoreApp:
             ),
             bus=self._bus,
             provider=compact_provider,
+            config=self._config,
         )
 
         server = SocketServer(
@@ -311,6 +350,7 @@ class CoreApp:
         server.register("session.get_history", self._session_history_handler)
         server.register("session.close", self._session_close_handler)
         server.register("session.clear", self._session_clear_handler)
+        server.register("session.recover", self._session_recover_handler)
         server.register("permission.respond", self._permission_respond_handler)
         server.register("session.compact", self._session_compact_handler)
 
@@ -325,13 +365,16 @@ class CoreApp:
         await shutdown.wait()
 
         logger.info("shutting down")
+        server.stop_accepting()
+        if self._sessions is not None:
+            await self._sessions.shutdown()
         for run_task in list(self._running_runs):
             run_task.cancel()
         if self._running_runs:
             await asyncio.gather(*self._running_runs, return_exceptions=True)
+        await server.stop()
         if self._mcp_manager is not None:
             await self._mcp_manager.stop_all()
-        await server.stop()
         if self._trace is not None:
             await self._trace.stop()
 

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from typing import Any
 
 TOOL_RESULT_LIMIT = 8_000
@@ -26,12 +27,18 @@ def truncate_tool_results(
             if block.get("type") == "tool_result" and isinstance(block.get("content"), str):
                 text = block["content"]
                 if len(text) > limit:
-                    omitted = len(text) - keep
+                    prefix = min(keep, limit)
+                    omitted = len(text) - prefix
                     block = dict(block)
                     block["content"] = (
-                        text[:keep]
+                        text[:prefix]
                         + f"\n[... {omitted} chars omitted. Full output in run events.]"
                     )
             new_blocks.append(block)
         result.append({**msg, "content": new_blocks})
     return result
+
+
+# 用序列化后的 UTF-8 字节数保守估算新增内容，避免中文和工具参数被字符除四低估
+def estimate_tokens(value: object) -> int:
+    return len(json.dumps(value, ensure_ascii=False).encode("utf-8"))

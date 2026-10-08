@@ -97,6 +97,8 @@ class McpClient:
         for item in response.get("content", []):
             if item.get("type") == "text":
                 parts.append(str(item["text"]))
+        if response.get("isError"):
+            raise McpToolError("\n".join(parts) or "MCP tool execution failed")
         return "\n".join(parts)
 
     # 后台任务：持续读取 stderr 并记录日志，防止管道缓冲区满

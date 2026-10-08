@@ -4,6 +4,19 @@ import asyncio
 import json
 import subprocess
 
+from x_claude.cli.commands.ping import _ping
+from x_claude.core.config import XConfig
+from x_claude.core.transport.auth import read_credential
+
+
+# 功能：验证 CLI ping 自动读取认证令牌，原有连通性检查命令仍能使用
+# 设计：调用真实 CLI 命令实现连接独立 daemon，避免 SocketClient 测试遗漏另一条原始 TCP 路径
+async def test_cli_ping_authenticates(
+    running_daemon: subprocess.Popen[bytes], free_port: int, capsys,
+) -> None:
+    await _ping(XConfig(port=free_port))
+    assert "pong server=" in capsys.readouterr().out
+
 
 # 功能：验证真实 daemon 响应 core.ping 命令并返回包含版本、uptime、时间戳的 PongResult
 # 设计：通过原始 TCP 连接发送 JSON-RPC 帧（不经过任何 SDK 客户端层），直接验证 wire 协议的端到端正确性
@@ -15,6 +28,7 @@ async def test_ping_returns_pong(
     req = {
         "jsonrpc": "2.0",
         "id": "test-1",
+        "auth_token": read_credential("127.0.0.1", free_port),
         "method": "core.ping",
         "params": {"client": "test/0.0.1"},
     }
@@ -44,6 +58,7 @@ async def test_unknown_method_returns_error(
     req = {
         "jsonrpc": "2.0",
         "id": "test-2",
+        "auth_token": read_credential("127.0.0.1", free_port),
         "method": "core.nonexistent",
         "params": {},
     }

@@ -3,6 +3,8 @@ from __future__ import annotations
 import asyncio
 import os
 import shutil
+import signal
+import subprocess
 from pathlib import Path
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -11,6 +13,48 @@ from x_claude.core.tools.base import BaseTool, ToolResult
 
 _MAX_OUTPUT_BYTES = 64 * 1024  # 64 KB
 _DEFAULT_TIMEOUT = 60
+
+
+# 分块排空输出，只保留固定字节预算，避免子进程的大量输出堆积在内存中
+async def _read_output(proc: asyncio.subprocess.Process) -> tuple[bytes, bool]:
+    assert proc.stdout is not None
+    output = bytearray()
+    truncated = False
+    while chunk := await proc.stdout.read(8192):
+        remaining = _MAX_OUTPUT_BYTES - len(output)
+        output.extend(chunk[:remaining])
+        truncated |= len(chunk) > remaining
+    await proc.wait()
+    return bytes(output), truncated
+
+
+# 只终止本工具启动的进程树，并限时回收管道；Windows 使用 PID 明确限定 taskkill 目标
+async def _stop_process(proc: asyncio.subprocess.Process) -> None:
+    try:
+        if os.name == "nt":
+            killer = await asyncio.create_subprocess_exec(
+                "taskkill", "/PID", str(proc.pid), "/T", "/F",
+                stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
+                creationflags=subprocess.CREATE_NO_WINDOW,
+            )
+            try:
+                await asyncio.wait_for(killer.wait(), timeout=3)
+            except TimeoutError:
+                killer.kill()
+                await killer.wait()
+        else:
+            getattr(os, "killpg")(proc.pid, getattr(signal, "SIGKILL"))
+    except (ProcessLookupError, OSError):
+        pass
+    if proc.returncode is None:
+        try:
+            proc.kill()
+        except ProcessLookupError:
+            pass
+    try:
+        await asyncio.wait_for(_read_output(proc), timeout=3)
+    except TimeoutError:
+        pass
 
 
 # 在 Windows 上定位 Git Bash，优先使用 PATH，其次根据 git.exe 的安装目录推导
@@ -85,32 +129,43 @@ class BashTool(BaseTool):
                     command,
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.STDOUT,
+                    creationflags=(subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0),
+                    start_new_session=os.name != "nt",
                 )
             else:
                 proc = await asyncio.create_subprocess_shell(
                     command,
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.STDOUT,
+                    start_new_session=True,
                 )
             try:
-                stdout_bytes, _ = await asyncio.wait_for(
-                    proc.communicate(), timeout=timeout
+                stdout_bytes, truncated = await asyncio.wait_for(
+                    _read_output(proc), timeout=timeout
                 )
             except TimeoutError:
-                proc.kill()
-                await proc.communicate()
+                await _stop_process(proc)
                 return ToolResult(
                     content=f"[timeout after {timeout}s]",
                     is_error=True,
                     error_type="timeout",
                 )
+            except asyncio.CancelledError:
+                cleanup = asyncio.create_task(_stop_process(proc))
+                try:
+                    await asyncio.shield(cleanup)
+                except asyncio.CancelledError:
+                    await cleanup
+                raise
+            except Exception:
+                await _stop_process(proc)
+                raise
         except Exception as exc:
             return ToolResult(content=str(exc), is_error=True, error_type="runtime_error")
 
         output = stdout_bytes.decode("utf-8", errors="replace")
-        truncated = len(stdout_bytes) > _MAX_OUTPUT_BYTES
         if truncated:
-            output = output[:_MAX_OUTPUT_BYTES] + "\n[truncated]"
+            output += "\n[truncated]"
 
         returncode = proc.returncode or 0
         if returncode != 0:
