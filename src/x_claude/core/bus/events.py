@@ -8,6 +8,7 @@ from pydantic import BaseModel, Discriminator, Field
 
 class RuntimeEvent(BaseModel):
     event_id: str = Field(default_factory=lambda: uuid4().hex)
+    log_positions: dict[str, tuple[int, int]] = Field(default_factory=dict)
 
 
 class SessionSynchronizedEvent(RuntimeEvent):
@@ -102,6 +103,33 @@ class LlmTokenEvent(RuntimeEvent):
     type: Literal["llm.token"] = "llm.token"
     run_id: str
     token: str
+    ts: str
+
+
+class LlmRetryingEvent(RuntimeEvent):
+    type: Literal["llm.retrying"] = "llm.retrying"
+    run_id: str
+    step: int
+    attempt: int
+    delay_s: float
+    ts: str
+
+
+class LlmTextCompletedEvent(RuntimeEvent):
+    type: Literal["llm.text_completed"] = "llm.text_completed"
+    run_id: str
+    step: int
+    text: str
+    ts: str
+
+
+class LlmErrorEvent(RuntimeEvent):
+    type: Literal["llm.error"] = "llm.error"
+    run_id: str
+    step: int
+    code: str
+    message: str
+    hint: str
     ts: str
 
 
@@ -257,6 +285,9 @@ Event = Annotated[
     | ToolCallFinishedEvent
     | ToolCallFailedEvent
     | LlmTokenEvent
+    | LlmRetryingEvent
+    | LlmTextCompletedEvent
+    | LlmErrorEvent
     | LlmUsageEvent
     | LlmModelSelectedEvent
     | LogLineEvent

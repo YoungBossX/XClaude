@@ -61,6 +61,7 @@ async def _serve(root: Path, provider: object, port: int = 0, permission_timeout
         ("session.recover", app._session_recover_handler),
         ("session.resume", app._session_resume_handler),
         ("session.continue", app._session_continue_handler),
+        ("session.history_page", app._session_history_page_handler),
         ("event.subscribe", app._subscribe_handler),
         ("permission.respond", app._permission_respond_handler),
     ]:

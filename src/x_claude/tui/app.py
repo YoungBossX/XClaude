@@ -22,6 +22,8 @@ from textual.widgets import Label, Static, TextArea
 from x_claude.core.config import XConfig
 from x_claude.core.skills.loader import SkillLoader
 from x_claude.core.transport.socket_client import IpcError, SocketClient
+from x_claude.tui.history import HistoryScreen
+from x_claude.tui.replay import ReplayProgress
 
 log = logging.getLogger(__name__)
 
@@ -71,6 +73,12 @@ class LLMStreamBlock(Static):
         self._text += token
         self.update(Text(f"Agent {self._label}\n{self._text}") if self._label else self._text)
 
+    # 重试与最终响应使用替换语义，不能把新尝试接在残缺前缀之后
+    def replace_text(self, text: str) -> None:
+        self._text = ""
+        self._finalized = False
+        self.append_token(text)
+
     # 将累积文本渲染为 Markdown，供流式块结束后显示
     def finalize_markdown(self) -> None:
         if self._finalized:
@@ -93,11 +101,16 @@ class ToolCallBlock(Widget):
     """
 
     # 初始化工具调用信息
-    def __init__(self, tool_name: str, params: dict[str, Any], *, agent_label: str = "") -> None:
+    def __init__(
+        self, tool_name: str, params: dict[str, Any], *, agent_label: str = "",
+        params_available: bool = True,
+    ) -> None:
         super().__init__()
         self._tool_name = tool_name
         self._params = params
-        self._params_full = _params_str(params)
+        self._params_available = params_available
+        self._params_full = (_params_str(params) if params_available else
+                             "开始事件未回放，调用参数未知。")
         self._output = ""
         self._elapsed_ms = 0
         self._is_error = False
@@ -119,6 +132,8 @@ class ToolCallBlock(Widget):
             line += f"  [dim]({escape(self._agent_label)})[/dim]"
         if params_pre:
             line += f"  [dim]{params_pre}[/dim]"
+        if not self._params_available:
+            line += "  [dim]补记结果（开始事件未回放）[/dim]"
         if self._finished:
             color = "red" if self._is_error else "green"
             status = "failed" if self._is_error else "done"
@@ -532,7 +547,10 @@ class XTuiApp(App[None]):
         self._resume_session_id = resume_session_id
         self._client: SocketClient | None = None
         self._llm_streams: dict[str, LLMStreamBlock] = {}
-        self._seen_event_ids: set[str] = set()
+        self._replay_progress = ReplayProgress()
+        self._seen_event_ids = self._replay_progress.seen
+        self._subscribed_once = False
+        self._prune_scheduled = False
         self._pending_tool_blocks: dict[tuple[str, str], ToolCallBlock] = {}
         self._pending_permission_blocks: dict[tuple[str, str], PermissionBlock] = {}
         self._session_id: str | None = None
@@ -562,6 +580,7 @@ class XTuiApp(App[None]):
             ("clear", "clear current conversation context"),
             ("compact", "compress context window"),
             ("recover", "核对并恢复后台任务：/recover 查看，带 run_id 确认"),
+            ("history", "分页浏览已保存的对话历史"),
         ]
         try:
             loader = SkillLoader()
@@ -603,7 +622,7 @@ class XTuiApp(App[None]):
 
     # 用户选中自动补全项后立即执行无参数内置命令，或将 skill 填入输入框等待补充任务
     def on_slash_complete_widget_selected(self, event: SlashCompleteWidget.Selected) -> None:
-        if event.skill_name in {"exit", "clear", "compact", "recover"}:
+        if event.skill_name in {"exit", "clear", "compact", "recover", "history"}:
             self._clear_builtin_command_draft()
         if event.skill_name == "exit":
             self.run_worker(self.action_quit(), name="quit", group="shutdown", exclusive=True)
@@ -616,6 +635,9 @@ class XTuiApp(App[None]):
             return
         if event.skill_name == "recover":
             self.run_worker(self._do_recover(), name="recover", group="recovery", exclusive=True)
+            return
+        if event.skill_name == "history":
+            self._show_history()
             return
         prompt = self._prompt()
         if prompt is not None:
@@ -668,6 +690,10 @@ class XTuiApp(App[None]):
         content = event.value.strip()
         if not content:
             return
+        if content == "/history":
+            self._clear_builtin_command_draft()
+            self._show_history()
+            return
         # 检测 /exit 指令，关闭 session 后退出 TUI
         if content == "/exit":
             event.text_area.text = ""
@@ -705,6 +731,11 @@ class XTuiApp(App[None]):
         self._append(Static(f"[bold]>[/bold] {content}", classes="user-turn"))
         self._update_header("running")
         self.run_worker(self._do_send_message(content), name="send_message", exclusive=False)
+
+    # 打开独立只读历史分页窗口，不改变当前运行和上下文
+    def _show_history(self) -> None:
+        if self._client is not None and self._session_id is not None:
+            self.push_screen(HistoryScreen(self._client, self._session_id))
 
     # 在 worker 中执行手动压缩命令，完成后显示结果横幅
     async def _do_compact(self) -> None:
@@ -769,7 +800,9 @@ class XTuiApp(App[None]):
             return
         self._session_id = str(result["session_id"])
         self._resume_session_id = self._session_id
-        self._seen_event_ids.clear()
+        self._replay_progress = ReplayProgress()
+        self._seen_event_ids = self._replay_progress.seen
+        self._subscribed_once = False
         self._pending_tool_blocks.clear()
         self._discard_permission_prompts()
         self._subagent_run_ids.clear()
@@ -840,6 +873,9 @@ class XTuiApp(App[None]):
     def _append(self, widget: Widget) -> None:
         log_view = self.query_one("#log-view", VerticalScroll)
         log_view.mount(widget)
+        if not self._prune_scheduled:
+            self._prune_scheduled = True
+            self.call_after_refresh(self._prune_log)
         log_view.scroll_end(animate=False)
 
     # 仅结束对应运行的流式块；清空会话时结束所有运行，避免相互截断或拼接
@@ -913,7 +949,16 @@ class XTuiApp(App[None]):
         if self._replay_run_id is not None:
             params["scope"] = f"run:{self._replay_run_id}"
             params["replay_from_run"] = self._replay_run_id
-        await self._client.send_command("event.subscribe", params)
+        if self._replay_run_id is None:
+            params["replay_offsets"] = dict(self._replay_progress.offsets)
+            if not self._subscribed_once:
+                params.update(replay_tail_runs=20, replay_tail_bytes=262144)
+        result = await self._client.send_command("event.subscribe", params)
+        self._replay_progress.synchronize(result.get("replay_offsets", {}))
+        self._subscribed_once = True
+        if result.get("history_truncated"):
+            self._append(Static("已载入最近活动；输入 /history 分页查看保存的对话。",
+                                markup=False, classes="log-line"))
 
     # 管理 SocketClient 生命周期：连接、会话订阅、断线重连
     async def _socket_loop(self) -> None:
@@ -989,24 +1034,67 @@ class XTuiApp(App[None]):
             self._update_header("disconnected")
             await asyncio.sleep(2)
 
+    # 限制已结束显示控件数量，保留运行中的文本、工具与审批，完整数据仍由历史入口读取
+    def _prune_log(self) -> None:
+        self._prune_scheduled = False
+        log_view = self.query_one("#log-view", VerticalScroll)
+        protected: set[Widget] = set(self._llm_streams.values())
+        protected.update(self._pending_tool_blocks.values())
+        protected.update(self._pending_permission_blocks.values())
+        excess = len(log_view.children) - 600
+        for widget in list(log_view.children):
+            if excess <= 0:
+                break
+            if widget not in protected:
+                widget.remove()
+                excess -= 1
+
     # 根据事件 type 路由到对应渲染逻辑；捕获异常防止 socket loop 因单个事件崩溃
     def _handle_event(self, event: dict[str, Any]) -> None:
         if (self._replay_run_id is None and self._session_id is not None
                 and event.get("session_id") not in (None, "", self._session_id)):
             return
-        event_id = str(event.get("event_id", ""))
-        if event_id and event_id in self._seen_event_ids:
+        if self._replay_progress.duplicate(event):
+            self._replay_progress.accept(event)
             return
         try:
             self._handle_event_inner(event)
-            if event_id:
-                self._seen_event_ids.add(event_id)
+            self._replay_progress.accept(event)
         except Exception:
             log.exception("_handle_event crashed  event_type=%s", event.get("type", "?"))
 
     # 实际的事件路由逻辑
     def _handle_event_inner(self, event: dict[str, Any]) -> None:
         t = event.get("type", "")
+
+        if t == "llm.retrying":
+            run_id = str(event.get("run_id", ""))
+            if run_id in self._llm_streams:
+                self._llm_streams[run_id].replace_text("")
+            self._append(Static(
+                f"模型连接中断 · {run_id} · 正在进行第 {event.get('attempt')} 次尝试",
+                markup=False, classes="log-line",
+            ))
+            return
+
+        if t == "llm.text_completed":
+            run_id = str(event.get("run_id", ""))
+            text = str(event.get("text", ""))
+            if run_id not in self._llm_streams and text:
+                block = LLMStreamBlock(f"{self._subagent_run_ids.get(run_id, 'main')} · {run_id}")
+                self._append(block)
+                self._llm_streams[run_id] = block
+            if run_id in self._llm_streams:
+                self._llm_streams[run_id].replace_text(text)
+            return
+
+        if t == "llm.error":
+            self._break_llm(str(event.get("run_id", "")))
+            self._append(Static(
+                f"{event.get('message', '模型调用失败')} [{event.get('code', 'llm_error')}]\n"
+                f"{event.get('hint', '')}", markup=False, classes="run-err",
+            ))
+            return
 
         if t == "llm.token":
             token = event.get("token", "")
@@ -1157,23 +1245,22 @@ class XTuiApp(App[None]):
             self._pending_tool_blocks[(str(run_id), tool_use_id)] = tc_block
             self._append(tc_block)
 
-        elif t == "tool.call_finished":
+        elif t in {"tool.call_finished", "tool.call_failed"}:
             tool_use_id = str(event.get("tool_use_id", ""))
-            key = (str(event.get("run_id", "")), tool_use_id)
+            run_id = str(event.get("run_id", ""))
+            key = (run_id, tool_use_id)
             elapsed_ms = int(event.get("elapsed_ms") or 0)
-            output = str(event.get("output") or "")
-            if key in self._pending_tool_blocks:
-                tc_done = self._pending_tool_blocks.pop(key)
-                tc_done.set_result(output, elapsed_ms)
-
-        elif t == "tool.call_failed":
-            tool_use_id = str(event.get("tool_use_id", ""))
-            key = (str(event.get("run_id", "")), tool_use_id)
-            elapsed_ms = int(event.get("elapsed_ms") or 0)
-            error_msg = str(event.get("error_message") or "")
-            if key in self._pending_tool_blocks:
-                tc_done = self._pending_tool_blocks.pop(key)
-                tc_done.set_result(error_msg, elapsed_ms, is_error=True)
+            is_error = t == "tool.call_failed"
+            output = str(event.get("error_message" if is_error else "output") or "")
+            tc_done = self._pending_tool_blocks.pop(key, None)
+            if tc_done is None:
+                label = f"{self._subagent_run_ids.get(run_id, 'run')} · {run_id[-6:]}"
+                tc_done = ToolCallBlock(str(event.get("tool_name", "unknown")), {},
+                                        agent_label=label, params_available=False)
+                if run_id in self._subagent_run_ids:
+                    tc_done.styles.padding = (0, 2, 0, 6)
+                self._append(tc_done)
+            tc_done.set_result(output, elapsed_ms, is_error=is_error)
 
         elif t == "run.finished":
             status = event.get("status", "")

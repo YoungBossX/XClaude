@@ -14,8 +14,8 @@ uv run mypy src
 
 # Tests
 uv run pytest tests/unit -v           # unit only (fast, no daemon)
-uv run pytest tests/integration -v    # needs no running daemon; fixture spawns one
-uv run pytest tests/ -v               # all
+uv run pytest tests/integration -v -m "not integration" # local TCP/TUI/process tests
+uv run pytest tests/ -v -m "not integration"            # excludes the real API test
 
 # Single test
 uv run pytest tests/unit/test_envelope.py::test_request_roundtrip -v
@@ -23,12 +23,13 @@ uv run pytest tests/unit/test_envelope.py::test_request_roundtrip -v
 # Regenerate WIRE_PROTOCOL.md after changing bus models
 uv run python scripts/gen_protocol_doc.py
 
-# Verify WIRE_PROTOCOL.md is in sync (used in CI equivalent)
+# Verify generated protocol documentation locally
 uv run python scripts/gen_protocol_doc.py --check
 
 # Run daemon manually
 uv run x-core                        # foreground; Ctrl+C to stop
-X_PORT=8000 uv run x-core        # override port
+# PowerShell: $env:X_PORT = "8000"; uv run x-core
+# POSIX shell: X_PORT=8000 uv run x-core
 
 # Send a ping
 uv run x ping
@@ -37,13 +38,13 @@ uv run x --version
 
 ## Architecture
 
-This is a **dual-process** local AI agent system. `x-core` is a persistent daemon; `x` and `x-tui` are clients that connect to it over a Unix domain socket.
+This is a **dual-process** local AI agent system. `x-core` is a persistent daemon; `x` and `x-tui` connect through authenticated loopback TCP using JSON-RPC 2.0 and NDJSON.
 
 ```
 x-core (daemon)
   └─ listens on 127.0.0.1:7437 (TCP)
        ↑ JSON-RPC 2.0 NDJSON
-x (CLI)   x-tui (TUI, S2+)
+x (CLI)   x-tui (TUI)
 ```
 
 **`x-tui` is the primary frontend.** All user-facing work on task management, observability, and interaction should be designed for and validated in the TUI first. The `x` CLI exists only for quick scripted testing and debugging — it is not a product surface. When implementing features that touch the user interface, invest in the TUI layout, event rendering, and keyboard interactions. Do not shortcut TUI work by pointing to the CLI as an alternative.
@@ -53,30 +54,35 @@ x (CLI)   x-tui (TUI, S2+)
 All IPC messages are typed pydantic v2 models with a **discriminated union on the `type` field**. This is the contract boundary — adding a new command or event means adding a new model class to `commands.py` or `events.py` and extending the `Command`/`Event` union.
 
 - `envelope.py` — `JsonRpcRequest`, `JsonRpcSuccess`, `JsonRpcError`, error code constants, `make_error()`
-- `commands.py` — `Command` union; currently only `PingCommand` + `PongResult`
-- `events.py` — `Event` union; currently only `CoreStartedEvent`
+- `commands.py` — ping, one-shot runs, session create/continue/resume/send/history/close/clear/compact/recover, event subscriptions and permission responses, with typed results.
+- `events.py` — run/step/tool/LLM/session/subagent/permission/compaction/skill events. Runtime events carry durable IDs; IPC also carries per-log byte ranges for incremental replay.
 
 `WIRE_PROTOCOL.md` is **generated** from these models by `scripts/gen_protocol_doc.py`. Always regenerate and commit it after changing bus models.
 
 ### Transport layer (`src/x_claude/core/transport/`)
 
-- `socket_server.py` — TCP server (`asyncio.start_server`); reads NDJSON lines, dispatches to registered `CommandHandler`s, handles JSON-RPC error cases. On `start()`, probes `host:port` first — errors if another daemon is already listening. Handlers registered via `server.register("method.name", handler_fn)`.
+- `socket_server.py` validates local IPC credentials, dispatches concurrent requests, and isolates disconnected clients. Register handlers via `server.register("method.name", handler_fn)`.
+- `ipc_broadcaster.py` filters session/run scopes, queues live events during replay, and binds permission responses to the authorized connection.
+- `event.subscribe` supports incremental session replay using acknowledged log offsets. Initial TUI replay is bounded; `/history` opens read-only message pages.
+- One OS lock per session-store directory prevents concurrent daemon writers even when ports differ. Keep the reusable `.daemon.lock` file.
 
 ### Config (`src/x_claude/core/config.py`)
 
-Four-tier priority: **built-in defaults → `~/.x/config.toml` → `.env` → env vars**.
+Priority: **built-in defaults → `~/.x/config.toml` → project `.x/config.toml` → environment overrides**. `.env` fills missing environment variables; existing OS variables win. Setting `X_CONFIG` selects one TOML file instead of the global/project pair.
 
-S0 keys: `host` (default `127.0.0.1`), `port` (default `7437`), `log_level`, `log_file`. Config file is silently skipped if absent; unknown keys cause a hard exit.
+TOML sections: `[core]`, `[logging]`, `[agent]`, `[llm]`, `[trace]`, `[permission]`, `[compaction]` and `[mcp]`. Unknown keys fail validation. See `RUNBOOK.md` and `.env.example` for supported settings.
 
-Relevant env vars: `X_CONFIG`, `X_HOST`, `X_PORT`, `X_LOG_LEVEL`, `X_LOG_FILE`, `X_LOG_FORMAT`.
+Agent limits include steps, concurrent model requests, total tasks, task-tree Token budget and runtime deadline. Auto compaction defaults to 80%; compatibility models should set their actual `X_CONTEXT_WINDOW`.
 
 ### Daemon entry (`src/x_claude/core/app.py`)
 
-`CoreApp.run()` is the single async entry point: loads config → sets up logging → creates `SocketServer` → registers handlers → waits for `SIGINT`/`SIGTERM` → calls `server.stop()`. Adding new handlers: instantiate a handler method on `CoreApp` and call `server.register()`.
+`CoreApp.run()` loads config, acquires the store lock, starts trace/permissions/MCP/session management and TCP, then waits for shutdown. Cleanup stops new requests, suspends recoverable tasks, closes clients and resources, and finally releases the lock. Windows uses a standard signal callback fallback.
+
+Task checkpoints and budget ledgers are persisted atomically. Unconfirmed interrupted tools require `/recover` review and are never automatically replayed. `/clear` and `/exit` retain explicit cancellation semantics.
 
 ### Testing
 
-Integration tests in `tests/conftest.py` spawn a real daemon subprocess using a random free port (via `free_port` fixture). The fixture finds a free port, releases it, passes it to the daemon via `X_PORT`, then polls `asyncio.open_connection` until the daemon is ready.
+Integration tests use temporary projects/stores, real TCP and subprocesses, and Textual's mounted test UI. The `running_daemon` fixture starts a real daemon on a random port with isolated session storage. The pytest marker named `integration` specifically selects real model API tests; it is not synonymous with the tests/integration directory.
 
 ### Code style
 
@@ -104,9 +110,8 @@ async def test_publish_reaches_subscriber() -> None:
 
 两行注释缺一不可。功能行让读者 5 秒内判断测试意图；设计行让读者理解测试背后的决策，而非只看到操作步骤。
 
-### Design docs (outside the repo)
+### Maintained references
 
-The planning documents live in `../docs/` (sibling of this repo, not committed here):
-- `agent_development_plan.md` — staged development roadmap S0–S8
-- `s0_implementation_plan.md` — detailed S0 decisions and rationale
-- `agent_functional_outline.md` — full feature catalogue
+- `README.md` — user-facing features and launch commands.
+- `RUNBOOK.md` — configuration, recovery and operational boundaries.
+- `WIRE_PROTOCOL.md` — generated current command/event contracts.

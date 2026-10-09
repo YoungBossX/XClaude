@@ -6,6 +6,7 @@ from typing import IO
 
 from pydantic import BaseModel
 
+from x_claude.core.bus.events import RuntimeEvent
 from x_claude.core.events.bus import EventBus
 
 logger = logging.getLogger(__name__)
@@ -37,8 +38,11 @@ class EventWriter:
         if self._file is None:
             return
         try:
-            self._file.write(event.model_dump_json() + "\n")
+            start = self._file.tell()
+            self._file.write(event.model_dump_json(exclude={"log_positions"}) + "\n")
             self._file.flush()
+            if isinstance(event, RuntimeEvent):
+                event.log_positions[self._path.parent.name] = (start, self._file.tell())
         except (OSError, ValueError) as e:
             logger.error("EventWriter: failed to write event: %s", e)
 

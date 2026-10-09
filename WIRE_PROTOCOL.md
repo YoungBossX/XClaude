@@ -155,7 +155,7 @@ All commands are sent as authenticated JSON-RPC 2.0 requests. `method` selects t
   "jsonrpc": "2.0",
   "id": "u-1",
   "result": {
-    "server_version": "0.2.0",
+    "server_version": "0.0.1",
     "uptime_ms": 12,
     "received_at": "2026-05-16T10:00:00.001Z"
   }
@@ -248,6 +248,9 @@ All commands are sent as authenticated JSON-RPC 2.0 requests. `method` selects t
 | `scope` | `string` | no |
 | `replay_from_run` | `string | null` | no |
 | `replay_session` | `boolean` | no |
+| `replay_offsets` | `object` | no |
+| `replay_tail_runs` | `integer` | no |
+| `replay_tail_bytes` | `integer` | no |
 
 ```json
 {
@@ -286,6 +289,28 @@ All commands are sent as authenticated JSON-RPC 2.0 requests. `method` selects t
       "default": false,
       "title": "Replay Session",
       "type": "boolean"
+    },
+    "replay_offsets": {
+      "additionalProperties": {
+        "minimum": 0,
+        "type": "integer"
+      },
+      "title": "Replay Offsets",
+      "type": "object"
+    },
+    "replay_tail_runs": {
+      "default": 0,
+      "maximum": 100,
+      "minimum": 0,
+      "title": "Replay Tail Runs",
+      "type": "integer"
+    },
+    "replay_tail_bytes": {
+      "default": 0,
+      "maximum": 1048576,
+      "minimum": 0,
+      "title": "Replay Tail Bytes",
+      "type": "integer"
     }
   },
   "required": [
@@ -323,6 +348,8 @@ All commands are sent as authenticated JSON-RPC 2.0 requests. `method` selects t
 |---|---|---|
 | `subscription_id` | `string` | yes |
 | `replayed_count` | `integer` | no |
+| `replay_offsets` | `object` | no |
+| `history_truncated` | `boolean` | no |
 
 ```json
 {
@@ -335,6 +362,18 @@ All commands are sent as authenticated JSON-RPC 2.0 requests. `method` selects t
       "default": 0,
       "title": "Replayed Count",
       "type": "integer"
+    },
+    "replay_offsets": {
+      "additionalProperties": {
+        "type": "integer"
+      },
+      "title": "Replay Offsets",
+      "type": "object"
+    },
+    "history_truncated": {
+      "default": false,
+      "title": "History Truncated",
+      "type": "boolean"
     }
   },
   "required": [
@@ -889,6 +928,430 @@ All commands are sent as authenticated JSON-RPC 2.0 requests. `method` selects t
 }
 ```
 
+### BackgroundTaskInfo
+
+| Field | Type | Required |
+|---|---|---|
+| `run_id` | `string` | yes |
+| `kind` | `string` | no |
+| `state` | `string` | yes |
+| `phase` | `string` | yes |
+| `step` | `integer` | yes |
+| `message` | `string` | no |
+| `pending_tools` | `array` | no |
+
+```json
+{
+  "properties": {
+    "run_id": {
+      "title": "Run Id",
+      "type": "string"
+    },
+    "kind": {
+      "default": "background",
+      "enum": [
+        "background",
+        "root"
+      ],
+      "title": "Kind",
+      "type": "string"
+    },
+    "state": {
+      "title": "State",
+      "type": "string"
+    },
+    "phase": {
+      "title": "Phase",
+      "type": "string"
+    },
+    "step": {
+      "title": "Step",
+      "type": "integer"
+    },
+    "message": {
+      "default": "",
+      "title": "Message",
+      "type": "string"
+    },
+    "pending_tools": {
+      "items": {
+        "additionalProperties": true,
+        "type": "object"
+      },
+      "title": "Pending Tools",
+      "type": "array"
+    }
+  },
+  "required": [
+    "run_id",
+    "state",
+    "phase",
+    "step"
+  ],
+  "title": "BackgroundTaskInfo",
+  "type": "object"
+}
+```
+
+### RecoveredToolResult
+
+| Field | Type | Required |
+|---|---|---|
+| `content` | `string` | yes |
+| `is_error` | `boolean` | no |
+
+```json
+{
+  "properties": {
+    "content": {
+      "title": "Content",
+      "type": "string"
+    },
+    "is_error": {
+      "default": false,
+      "title": "Is Error",
+      "type": "boolean"
+    }
+  },
+  "required": [
+    "content"
+  ],
+  "title": "RecoveredToolResult",
+  "type": "object"
+}
+```
+
+### SessionClearCommand
+
+| Field | Type | Required |
+|---|---|---|
+| `type` | `string` | no |
+| `session_id` | `string` | yes |
+
+```json
+{
+  "properties": {
+    "type": {
+      "const": "session.clear",
+      "default": "session.clear",
+      "title": "Type",
+      "type": "string"
+    },
+    "session_id": {
+      "title": "Session Id",
+      "type": "string"
+    }
+  },
+  "required": [
+    "session_id"
+  ],
+  "title": "SessionClearCommand",
+  "type": "object"
+}
+```
+
+### SessionClearResult
+
+| Field | Type | Required |
+|---|---|---|
+| `session_id` | `string` | yes |
+| `status` | `string` | yes |
+
+```json
+{
+  "properties": {
+    "session_id": {
+      "title": "Session Id",
+      "type": "string"
+    },
+    "status": {
+      "enum": [
+        "active",
+        "waiting_for_input",
+        "closed"
+      ],
+      "title": "Status",
+      "type": "string"
+    }
+  },
+  "required": [
+    "session_id",
+    "status"
+  ],
+  "title": "SessionClearResult",
+  "type": "object"
+}
+```
+
+### SessionCompactCommand
+
+| Field | Type | Required |
+|---|---|---|
+| `type` | `string` | no |
+| `session_id` | `string` | yes |
+| `focus` | `string` | no |
+
+```json
+{
+  "properties": {
+    "type": {
+      "const": "session.compact",
+      "default": "session.compact",
+      "title": "Type",
+      "type": "string"
+    },
+    "session_id": {
+      "title": "Session Id",
+      "type": "string"
+    },
+    "focus": {
+      "default": "",
+      "title": "Focus",
+      "type": "string"
+    }
+  },
+  "required": [
+    "session_id"
+  ],
+  "title": "SessionCompactCommand",
+  "type": "object"
+}
+```
+
+### SessionCompactResult
+
+| Field | Type | Required |
+|---|---|---|
+| `summary_tokens` | `integer` | yes |
+| `saved_tokens` | `integer` | yes |
+
+```json
+{
+  "properties": {
+    "summary_tokens": {
+      "title": "Summary Tokens",
+      "type": "integer"
+    },
+    "saved_tokens": {
+      "title": "Saved Tokens",
+      "type": "integer"
+    }
+  },
+  "required": [
+    "summary_tokens",
+    "saved_tokens"
+  ],
+  "title": "SessionCompactResult",
+  "type": "object"
+}
+```
+
+### SessionContinueCommand
+
+| Field | Type | Required |
+|---|---|---|
+| `type` | `string` | no |
+
+```json
+{
+  "properties": {
+    "type": {
+      "const": "session.continue",
+      "default": "session.continue",
+      "title": "Type",
+      "type": "string"
+    }
+  },
+  "title": "SessionContinueCommand",
+  "type": "object"
+}
+```
+
+### SessionContinueResult
+
+| Field | Type | Required |
+|---|---|---|
+| `session_id` | `string` | yes |
+| `status` | `string` | yes |
+
+```json
+{
+  "properties": {
+    "session_id": {
+      "title": "Session Id",
+      "type": "string"
+    },
+    "status": {
+      "enum": [
+        "active",
+        "waiting_for_input",
+        "closed"
+      ],
+      "title": "Status",
+      "type": "string"
+    }
+  },
+  "required": [
+    "session_id",
+    "status"
+  ],
+  "title": "SessionContinueResult",
+  "type": "object"
+}
+```
+
+### SessionHistoryPageCommand
+
+| Field | Type | Required |
+|---|---|---|
+| `type` | `string` | no |
+| `session_id` | `string` | yes |
+| `cursor` | `string | null` | no |
+| `limit` | `integer` | no |
+
+```json
+{
+  "properties": {
+    "type": {
+      "const": "session.history_page",
+      "default": "session.history_page",
+      "title": "Type",
+      "type": "string"
+    },
+    "session_id": {
+      "title": "Session Id",
+      "type": "string"
+    },
+    "cursor": {
+      "anyOf": [
+        {
+          "maxLength": 100,
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Cursor"
+    },
+    "limit": {
+      "default": 20,
+      "maximum": 100,
+      "minimum": 1,
+      "title": "Limit",
+      "type": "integer"
+    }
+  },
+  "required": [
+    "session_id"
+  ],
+  "title": "SessionHistoryPageCommand",
+  "type": "object"
+}
+```
+
+### SessionHistoryPageResult
+
+| Field | Type | Required |
+|---|---|---|
+| `messages` | `array` | yes |
+| `next_cursor` | `string | null` | no |
+
+```json
+{
+  "properties": {
+    "messages": {
+      "items": {
+        "additionalProperties": true,
+        "type": "object"
+      },
+      "title": "Messages",
+      "type": "array"
+    },
+    "next_cursor": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Next Cursor"
+    }
+  },
+  "required": [
+    "messages"
+  ],
+  "title": "SessionHistoryPageResult",
+  "type": "object"
+}
+```
+
+### SessionResumeCommand
+
+| Field | Type | Required |
+|---|---|---|
+| `type` | `string` | no |
+| `session_id` | `string` | yes |
+
+```json
+{
+  "properties": {
+    "type": {
+      "const": "session.resume",
+      "default": "session.resume",
+      "title": "Type",
+      "type": "string"
+    },
+    "session_id": {
+      "title": "Session Id",
+      "type": "string"
+    }
+  },
+  "required": [
+    "session_id"
+  ],
+  "title": "SessionResumeCommand",
+  "type": "object"
+}
+```
+
+### SessionResumeResult
+
+| Field | Type | Required |
+|---|---|---|
+| `session_id` | `string` | yes |
+| `status` | `string` | yes |
+
+```json
+{
+  "properties": {
+    "session_id": {
+      "title": "Session Id",
+      "type": "string"
+    },
+    "status": {
+      "enum": [
+        "active",
+        "waiting_for_input",
+        "closed"
+      ],
+      "title": "Status",
+      "type": "string"
+    }
+  },
+  "required": [
+    "session_id",
+    "status"
+  ],
+  "title": "SessionResumeResult",
+  "type": "object"
+}
+```
+
 ## Server Push
 
 Events pushed from daemon to subscribed clients over the same TCP connection.
@@ -946,6 +1409,7 @@ Events sent over the IPC socket (daemon → client).
 | Field | Type | Required |
 |---|---|---|
 | `event_id` | `string` | no |
+| `log_positions` | `object` | no |
 | `type` | `string` | no |
 | `listen_addr` | `string` | yes |
 | `version` | `string` | yes |
@@ -956,6 +1420,23 @@ Events sent over the IPC socket (daemon → client).
     "event_id": {
       "title": "Event Id",
       "type": "string"
+    },
+    "log_positions": {
+      "additionalProperties": {
+        "maxItems": 2,
+        "minItems": 2,
+        "prefixItems": [
+          {
+            "type": "integer"
+          },
+          {
+            "type": "integer"
+          }
+        ],
+        "type": "array"
+      },
+      "title": "Log Positions",
+      "type": "object"
     },
     "type": {
       "const": "core.started",
@@ -983,13 +1464,20 @@ Events sent over the IPC socket (daemon → client).
 
 ## Run Events
 
-Events written to `runs/<run_id>/events.jsonl` and forwarded over IPC to subscribed clients.
+Events are written to `~/.x/sessions/<session_id>/runs/<run_id>/events.jsonl` and forwarded over IPC. Direct standalone runners may use `runs/<run_id>/events.jsonl`.
+
+`log_positions` carries per-log `[start, end]` byte offsets on IPC; it is reconstructed during replay and is not stored recursively in JSONL. A client must acknowledge only contiguous received ranges, never jump over an unseen event.
+
+Session replay accepts `replay_offsets`; the response confirms delivered snapshot offsets. Initial TUI history is bounded using `replay_tail_runs` / `replay_tail_bytes`; subsequent reconnects request the complete missing suffix. Historical approvals are not reactivated. `session.history_page` reads stored messages without executing tasks. Message previews exceeding 16000 characters are truncated before transmission, with an explicit notice; persisted history and model context are unchanged.
+
+`llm.retrying` resets the incomplete text for that run. `llm.text_completed` replaces the attempt's displayed text with the complete response. `llm.error` carries a stable code and a safe, actionable hint.
 
 ### RunStartedEvent
 
 | Field | Type | Required |
 |---|---|---|
 | `event_id` | `string` | no |
+| `log_positions` | `object` | no |
 | `type` | `string` | no |
 | `run_id` | `string` | yes |
 | `session_id` | `string` | no |
@@ -1003,6 +1491,23 @@ Events written to `runs/<run_id>/events.jsonl` and forwarded over IPC to subscri
     "event_id": {
       "title": "Event Id",
       "type": "string"
+    },
+    "log_positions": {
+      "additionalProperties": {
+        "maxItems": 2,
+        "minItems": 2,
+        "prefixItems": [
+          {
+            "type": "integer"
+          },
+          {
+            "type": "integer"
+          }
+        ],
+        "type": "array"
+      },
+      "title": "Log Positions",
+      "type": "object"
     },
     "type": {
       "const": "run.started",
@@ -1059,6 +1564,7 @@ Events written to `runs/<run_id>/events.jsonl` and forwarded over IPC to subscri
 | Field | Type | Required |
 |---|---|---|
 | `event_id` | `string` | no |
+| `log_positions` | `object` | no |
 | `type` | `string` | no |
 | `run_id` | `string` | yes |
 | `session_id` | `string` | yes |
@@ -1073,6 +1579,23 @@ Events written to `runs/<run_id>/events.jsonl` and forwarded over IPC to subscri
     "event_id": {
       "title": "Event Id",
       "type": "string"
+    },
+    "log_positions": {
+      "additionalProperties": {
+        "maxItems": 2,
+        "minItems": 2,
+        "prefixItems": [
+          {
+            "type": "integer"
+          },
+          {
+            "type": "integer"
+          }
+        ],
+        "type": "array"
+      },
+      "title": "Log Positions",
+      "type": "object"
     },
     "type": {
       "const": "run.restored",
@@ -1123,6 +1646,7 @@ Events written to `runs/<run_id>/events.jsonl` and forwarded over IPC to subscri
 | Field | Type | Required |
 |---|---|---|
 | `event_id` | `string` | no |
+| `log_positions` | `object` | no |
 | `type` | `string` | no |
 | `run_id` | `string` | yes |
 | `status` | `string` | yes |
@@ -1136,6 +1660,23 @@ Events written to `runs/<run_id>/events.jsonl` and forwarded over IPC to subscri
     "event_id": {
       "title": "Event Id",
       "type": "string"
+    },
+    "log_positions": {
+      "additionalProperties": {
+        "maxItems": 2,
+        "minItems": 2,
+        "prefixItems": [
+          {
+            "type": "integer"
+          },
+          {
+            "type": "integer"
+          }
+        ],
+        "type": "array"
+      },
+      "title": "Log Positions",
+      "type": "object"
     },
     "type": {
       "const": "run.finished",
@@ -1201,6 +1742,7 @@ Events written to `runs/<run_id>/events.jsonl` and forwarded over IPC to subscri
 | Field | Type | Required |
 |---|---|---|
 | `event_id` | `string` | no |
+| `log_positions` | `object` | no |
 | `type` | `string` | no |
 | `run_id` | `string` | yes |
 | `step` | `integer` | yes |
@@ -1212,6 +1754,23 @@ Events written to `runs/<run_id>/events.jsonl` and forwarded over IPC to subscri
     "event_id": {
       "title": "Event Id",
       "type": "string"
+    },
+    "log_positions": {
+      "additionalProperties": {
+        "maxItems": 2,
+        "minItems": 2,
+        "prefixItems": [
+          {
+            "type": "integer"
+          },
+          {
+            "type": "integer"
+          }
+        ],
+        "type": "array"
+      },
+      "title": "Log Positions",
+      "type": "object"
     },
     "type": {
       "const": "step.started",
@@ -1258,6 +1817,7 @@ Events written to `runs/<run_id>/events.jsonl` and forwarded over IPC to subscri
 | Field | Type | Required |
 |---|---|---|
 | `event_id` | `string` | no |
+| `log_positions` | `object` | no |
 | `type` | `string` | no |
 | `run_id` | `string` | yes |
 | `step` | `integer` | yes |
@@ -1269,6 +1829,23 @@ Events written to `runs/<run_id>/events.jsonl` and forwarded over IPC to subscri
     "event_id": {
       "title": "Event Id",
       "type": "string"
+    },
+    "log_positions": {
+      "additionalProperties": {
+        "maxItems": 2,
+        "minItems": 2,
+        "prefixItems": [
+          {
+            "type": "integer"
+          },
+          {
+            "type": "integer"
+          }
+        ],
+        "type": "array"
+      },
+      "title": "Log Positions",
+      "type": "object"
     },
     "type": {
       "const": "step.finished",
@@ -1315,6 +1892,7 @@ Events written to `runs/<run_id>/events.jsonl` and forwarded over IPC to subscri
 | Field | Type | Required |
 |---|---|---|
 | `event_id` | `string` | no |
+| `log_positions` | `object` | no |
 | `type` | `string` | no |
 | `run_id` | `string` | yes |
 | `tool_use_id` | `string` | yes |
@@ -1328,6 +1906,23 @@ Events written to `runs/<run_id>/events.jsonl` and forwarded over IPC to subscri
     "event_id": {
       "title": "Event Id",
       "type": "string"
+    },
+    "log_positions": {
+      "additionalProperties": {
+        "maxItems": 2,
+        "minItems": 2,
+        "prefixItems": [
+          {
+            "type": "integer"
+          },
+          {
+            "type": "integer"
+          }
+        ],
+        "type": "array"
+      },
+      "title": "Log Positions",
+      "type": "object"
     },
     "type": {
       "const": "tool.call_started",
@@ -1389,6 +1984,7 @@ Events written to `runs/<run_id>/events.jsonl` and forwarded over IPC to subscri
 | Field | Type | Required |
 |---|---|---|
 | `event_id` | `string` | no |
+| `log_positions` | `object` | no |
 | `type` | `string` | no |
 | `run_id` | `string` | yes |
 | `tool_use_id` | `string` | yes |
@@ -1403,6 +1999,23 @@ Events written to `runs/<run_id>/events.jsonl` and forwarded over IPC to subscri
     "event_id": {
       "title": "Event Id",
       "type": "string"
+    },
+    "log_positions": {
+      "additionalProperties": {
+        "maxItems": 2,
+        "minItems": 2,
+        "prefixItems": [
+          {
+            "type": "integer"
+          },
+          {
+            "type": "integer"
+          }
+        ],
+        "type": "array"
+      },
+      "title": "Log Positions",
+      "type": "object"
     },
     "type": {
       "const": "tool.call_finished",
@@ -1466,6 +2079,7 @@ Events written to `runs/<run_id>/events.jsonl` and forwarded over IPC to subscri
 | Field | Type | Required |
 |---|---|---|
 | `event_id` | `string` | no |
+| `log_positions` | `object` | no |
 | `type` | `string` | no |
 | `run_id` | `string` | yes |
 | `tool_use_id` | `string` | yes |
@@ -1482,6 +2096,23 @@ Events written to `runs/<run_id>/events.jsonl` and forwarded over IPC to subscri
     "event_id": {
       "title": "Event Id",
       "type": "string"
+    },
+    "log_positions": {
+      "additionalProperties": {
+        "maxItems": 2,
+        "minItems": 2,
+        "prefixItems": [
+          {
+            "type": "integer"
+          },
+          {
+            "type": "integer"
+          }
+        ],
+        "type": "array"
+      },
+      "title": "Log Positions",
+      "type": "object"
     },
     "type": {
       "const": "tool.call_failed",
@@ -1558,6 +2189,7 @@ Events written to `runs/<run_id>/events.jsonl` and forwarded over IPC to subscri
 | Field | Type | Required |
 |---|---|---|
 | `event_id` | `string` | no |
+| `log_positions` | `object` | no |
 | `type` | `string` | no |
 | `run_id` | `string` | yes |
 | `model` | `string` | yes |
@@ -1570,6 +2202,23 @@ Events written to `runs/<run_id>/events.jsonl` and forwarded over IPC to subscri
     "event_id": {
       "title": "Event Id",
       "type": "string"
+    },
+    "log_positions": {
+      "additionalProperties": {
+        "maxItems": 2,
+        "minItems": 2,
+        "prefixItems": [
+          {
+            "type": "integer"
+          },
+          {
+            "type": "integer"
+          }
+        ],
+        "type": "array"
+      },
+      "title": "Log Positions",
+      "type": "object"
     },
     "type": {
       "const": "llm.model_selected",
@@ -1622,6 +2271,7 @@ Events written to `runs/<run_id>/events.jsonl` and forwarded over IPC to subscri
 | Field | Type | Required |
 |---|---|---|
 | `event_id` | `string` | no |
+| `log_positions` | `object` | no |
 | `type` | `string` | no |
 | `run_id` | `string` | yes |
 | `token` | `string` | yes |
@@ -1633,6 +2283,23 @@ Events written to `runs/<run_id>/events.jsonl` and forwarded over IPC to subscri
     "event_id": {
       "title": "Event Id",
       "type": "string"
+    },
+    "log_positions": {
+      "additionalProperties": {
+        "maxItems": 2,
+        "minItems": 2,
+        "prefixItems": [
+          {
+            "type": "integer"
+          },
+          {
+            "type": "integer"
+          }
+        ],
+        "type": "array"
+      },
+      "title": "Log Positions",
+      "type": "object"
     },
     "type": {
       "const": "llm.token",
@@ -1679,6 +2346,7 @@ Events written to `runs/<run_id>/events.jsonl` and forwarded over IPC to subscri
 | Field | Type | Required |
 |---|---|---|
 | `event_id` | `string` | no |
+| `log_positions` | `object` | no |
 | `type` | `string` | no |
 | `run_id` | `string` | yes |
 | `input_tokens` | `integer` | yes |
@@ -1695,6 +2363,23 @@ Events written to `runs/<run_id>/events.jsonl` and forwarded over IPC to subscri
     "event_id": {
       "title": "Event Id",
       "type": "string"
+    },
+    "log_positions": {
+      "additionalProperties": {
+        "maxItems": 2,
+        "minItems": 2,
+        "prefixItems": [
+          {
+            "type": "integer"
+          },
+          {
+            "type": "integer"
+          }
+        ],
+        "type": "array"
+      },
+      "title": "Log Positions",
+      "type": "object"
     },
     "type": {
       "const": "llm.usage",
@@ -1769,6 +2454,7 @@ Events written to `runs/<run_id>/events.jsonl` and forwarded over IPC to subscri
 | Field | Type | Required |
 |---|---|---|
 | `event_id` | `string` | no |
+| `log_positions` | `object` | no |
 | `type` | `string` | no |
 | `run_id` | `string` | yes |
 | `level` | `string` | yes |
@@ -1782,6 +2468,23 @@ Events written to `runs/<run_id>/events.jsonl` and forwarded over IPC to subscri
     "event_id": {
       "title": "Event Id",
       "type": "string"
+    },
+    "log_positions": {
+      "additionalProperties": {
+        "maxItems": 2,
+        "minItems": 2,
+        "prefixItems": [
+          {
+            "type": "integer"
+          },
+          {
+            "type": "integer"
+          }
+        ],
+        "type": "array"
+      },
+      "title": "Log Positions",
+      "type": "object"
     },
     "type": {
       "const": "log.line",
@@ -1842,6 +2545,7 @@ Events written to `runs/<run_id>/events.jsonl` and forwarded over IPC to subscri
 | Field | Type | Required |
 |---|---|---|
 | `event_id` | `string` | no |
+| `log_positions` | `object` | no |
 | `type` | `string` | no |
 | `session_id` | `string` | yes |
 | `mode` | `string` | yes |
@@ -1853,6 +2557,23 @@ Events written to `runs/<run_id>/events.jsonl` and forwarded over IPC to subscri
     "event_id": {
       "title": "Event Id",
       "type": "string"
+    },
+    "log_positions": {
+      "additionalProperties": {
+        "maxItems": 2,
+        "minItems": 2,
+        "prefixItems": [
+          {
+            "type": "integer"
+          },
+          {
+            "type": "integer"
+          }
+        ],
+        "type": "array"
+      },
+      "title": "Log Positions",
+      "type": "object"
     },
     "type": {
       "const": "session.created",
@@ -1899,6 +2620,7 @@ Events written to `runs/<run_id>/events.jsonl` and forwarded over IPC to subscri
 | Field | Type | Required |
 |---|---|---|
 | `event_id` | `string` | no |
+| `log_positions` | `object` | no |
 | `type` | `string` | no |
 | `session_id` | `string` | yes |
 | `content` | `string` | yes |
@@ -1910,6 +2632,23 @@ Events written to `runs/<run_id>/events.jsonl` and forwarded over IPC to subscri
     "event_id": {
       "title": "Event Id",
       "type": "string"
+    },
+    "log_positions": {
+      "additionalProperties": {
+        "maxItems": 2,
+        "minItems": 2,
+        "prefixItems": [
+          {
+            "type": "integer"
+          },
+          {
+            "type": "integer"
+          }
+        ],
+        "type": "array"
+      },
+      "title": "Log Positions",
+      "type": "object"
     },
     "type": {
       "const": "session.message_received",
@@ -1956,6 +2695,7 @@ Events written to `runs/<run_id>/events.jsonl` and forwarded over IPC to subscri
 | Field | Type | Required |
 |---|---|---|
 | `event_id` | `string` | no |
+| `log_positions` | `object` | no |
 | `type` | `string` | no |
 | `session_id` | `string` | yes |
 | `last_run_id` | `string` | yes |
@@ -1967,6 +2707,23 @@ Events written to `runs/<run_id>/events.jsonl` and forwarded over IPC to subscri
     "event_id": {
       "title": "Event Id",
       "type": "string"
+    },
+    "log_positions": {
+      "additionalProperties": {
+        "maxItems": 2,
+        "minItems": 2,
+        "prefixItems": [
+          {
+            "type": "integer"
+          },
+          {
+            "type": "integer"
+          }
+        ],
+        "type": "array"
+      },
+      "title": "Log Positions",
+      "type": "object"
     },
     "type": {
       "const": "session.waiting_for_input",
@@ -2013,6 +2770,7 @@ Events written to `runs/<run_id>/events.jsonl` and forwarded over IPC to subscri
 | Field | Type | Required |
 |---|---|---|
 | `event_id` | `string` | no |
+| `log_positions` | `object` | no |
 | `type` | `string` | no |
 | `session_id` | `string` | yes |
 | `ts` | `string` | yes |
@@ -2023,6 +2781,23 @@ Events written to `runs/<run_id>/events.jsonl` and forwarded over IPC to subscri
     "event_id": {
       "title": "Event Id",
       "type": "string"
+    },
+    "log_positions": {
+      "additionalProperties": {
+        "maxItems": 2,
+        "minItems": 2,
+        "prefixItems": [
+          {
+            "type": "integer"
+          },
+          {
+            "type": "integer"
+          }
+        ],
+        "type": "array"
+      },
+      "title": "Log Positions",
+      "type": "object"
     },
     "type": {
       "const": "session.resumed",
@@ -2063,6 +2838,7 @@ Events written to `runs/<run_id>/events.jsonl` and forwarded over IPC to subscri
 | Field | Type | Required |
 |---|---|---|
 | `event_id` | `string` | no |
+| `log_positions` | `object` | no |
 | `type` | `string` | no |
 | `session_id` | `string` | yes |
 | `ts` | `string` | yes |
@@ -2073,6 +2849,23 @@ Events written to `runs/<run_id>/events.jsonl` and forwarded over IPC to subscri
     "event_id": {
       "title": "Event Id",
       "type": "string"
+    },
+    "log_positions": {
+      "additionalProperties": {
+        "maxItems": 2,
+        "minItems": 2,
+        "prefixItems": [
+          {
+            "type": "integer"
+          },
+          {
+            "type": "integer"
+          }
+        ],
+        "type": "array"
+      },
+      "title": "Log Positions",
+      "type": "object"
     },
     "type": {
       "const": "session.closed",
@@ -2113,6 +2906,7 @@ Events written to `runs/<run_id>/events.jsonl` and forwarded over IPC to subscri
 | Field | Type | Required |
 |---|---|---|
 | `event_id` | `string` | no |
+| `log_positions` | `object` | no |
 | `type` | `string` | no |
 | `session_id` | `string` | yes |
 | `status` | `string` | yes |
@@ -2125,6 +2919,23 @@ Events written to `runs/<run_id>/events.jsonl` and forwarded over IPC to subscri
     "event_id": {
       "title": "Event Id",
       "type": "string"
+    },
+    "log_positions": {
+      "additionalProperties": {
+        "maxItems": 2,
+        "minItems": 2,
+        "prefixItems": [
+          {
+            "type": "integer"
+          },
+          {
+            "type": "integer"
+          }
+        ],
+        "type": "array"
+      },
+      "title": "Log Positions",
+      "type": "object"
     },
     "type": {
       "const": "session.synchronized",
@@ -2172,6 +2983,7 @@ Events written to `runs/<run_id>/events.jsonl` and forwarded over IPC to subscri
 | Field | Type | Required |
 |---|---|---|
 | `event_id` | `string` | no |
+| `log_positions` | `object` | no |
 | `type` | `string` | no |
 | `run_id` | `string` | yes |
 | `parent_run_id` | `string` | yes |
@@ -2186,6 +2998,23 @@ Events written to `runs/<run_id>/events.jsonl` and forwarded over IPC to subscri
     "event_id": {
       "title": "Event Id",
       "type": "string"
+    },
+    "log_positions": {
+      "additionalProperties": {
+        "maxItems": 2,
+        "minItems": 2,
+        "prefixItems": [
+          {
+            "type": "integer"
+          },
+          {
+            "type": "integer"
+          }
+        ],
+        "type": "array"
+      },
+      "title": "Log Positions",
+      "type": "object"
     },
     "type": {
       "const": "subagent.started",
@@ -2236,6 +3065,7 @@ Events written to `runs/<run_id>/events.jsonl` and forwarded over IPC to subscri
 | Field | Type | Required |
 |---|---|---|
 | `event_id` | `string` | no |
+| `log_positions` | `object` | no |
 | `type` | `string` | no |
 | `run_id` | `string` | yes |
 | `session_id` | `string` | yes |
@@ -2252,6 +3082,23 @@ Events written to `runs/<run_id>/events.jsonl` and forwarded over IPC to subscri
     "event_id": {
       "title": "Event Id",
       "type": "string"
+    },
+    "log_positions": {
+      "additionalProperties": {
+        "maxItems": 2,
+        "minItems": 2,
+        "prefixItems": [
+          {
+            "type": "integer"
+          },
+          {
+            "type": "integer"
+          }
+        ],
+        "type": "array"
+      },
+      "title": "Log Positions",
+      "type": "object"
     },
     "type": {
       "const": "subagent.restored",
@@ -2312,6 +3159,7 @@ Events written to `runs/<run_id>/events.jsonl` and forwarded over IPC to subscri
 | Field | Type | Required |
 |---|---|---|
 | `event_id` | `string` | no |
+| `log_positions` | `object` | no |
 | `type` | `string` | no |
 | `run_id` | `string` | yes |
 | `parent_run_id` | `string` | yes |
@@ -2325,6 +3173,23 @@ Events written to `runs/<run_id>/events.jsonl` and forwarded over IPC to subscri
     "event_id": {
       "title": "Event Id",
       "type": "string"
+    },
+    "log_positions": {
+      "additionalProperties": {
+        "maxItems": 2,
+        "minItems": 2,
+        "prefixItems": [
+          {
+            "type": "integer"
+          },
+          {
+            "type": "integer"
+          }
+        ],
+        "type": "array"
+      },
+      "title": "Log Positions",
+      "type": "object"
     },
     "type": {
       "const": "subagent.finished",
@@ -2365,6 +3230,652 @@ Events written to `runs/<run_id>/events.jsonl` and forwarded over IPC to subscri
 }
 ```
 
+### ContextCompactedEvent
+
+| Field | Type | Required |
+|---|---|---|
+| `event_id` | `string` | no |
+| `log_positions` | `object` | no |
+| `type` | `string` | no |
+| `session_id` | `string` | yes |
+| `run_id` | `string` | yes |
+| `original_tokens` | `integer` | yes |
+| `summary_tokens` | `integer` | yes |
+| `ts` | `string` | yes |
+
+```json
+{
+  "properties": {
+    "event_id": {
+      "title": "Event Id",
+      "type": "string"
+    },
+    "log_positions": {
+      "additionalProperties": {
+        "maxItems": 2,
+        "minItems": 2,
+        "prefixItems": [
+          {
+            "type": "integer"
+          },
+          {
+            "type": "integer"
+          }
+        ],
+        "type": "array"
+      },
+      "title": "Log Positions",
+      "type": "object"
+    },
+    "type": {
+      "const": "context.compacted",
+      "default": "context.compacted",
+      "title": "Type",
+      "type": "string"
+    },
+    "session_id": {
+      "title": "Session Id",
+      "type": "string"
+    },
+    "run_id": {
+      "title": "Run Id",
+      "type": "string"
+    },
+    "original_tokens": {
+      "title": "Original Tokens",
+      "type": "integer"
+    },
+    "summary_tokens": {
+      "title": "Summary Tokens",
+      "type": "integer"
+    },
+    "ts": {
+      "title": "Ts",
+      "type": "string"
+    }
+  },
+  "required": [
+    "session_id",
+    "run_id",
+    "original_tokens",
+    "summary_tokens",
+    "ts"
+  ],
+  "title": "ContextCompactedEvent",
+  "type": "object"
+}
+```
+
+### LlmErrorEvent
+
+| Field | Type | Required |
+|---|---|---|
+| `event_id` | `string` | no |
+| `log_positions` | `object` | no |
+| `type` | `string` | no |
+| `run_id` | `string` | yes |
+| `step` | `integer` | yes |
+| `code` | `string` | yes |
+| `message` | `string` | yes |
+| `hint` | `string` | yes |
+| `ts` | `string` | yes |
+
+```json
+{
+  "properties": {
+    "event_id": {
+      "title": "Event Id",
+      "type": "string"
+    },
+    "log_positions": {
+      "additionalProperties": {
+        "maxItems": 2,
+        "minItems": 2,
+        "prefixItems": [
+          {
+            "type": "integer"
+          },
+          {
+            "type": "integer"
+          }
+        ],
+        "type": "array"
+      },
+      "title": "Log Positions",
+      "type": "object"
+    },
+    "type": {
+      "const": "llm.error",
+      "default": "llm.error",
+      "title": "Type",
+      "type": "string"
+    },
+    "run_id": {
+      "title": "Run Id",
+      "type": "string"
+    },
+    "step": {
+      "title": "Step",
+      "type": "integer"
+    },
+    "code": {
+      "title": "Code",
+      "type": "string"
+    },
+    "message": {
+      "title": "Message",
+      "type": "string"
+    },
+    "hint": {
+      "title": "Hint",
+      "type": "string"
+    },
+    "ts": {
+      "title": "Ts",
+      "type": "string"
+    }
+  },
+  "required": [
+    "run_id",
+    "step",
+    "code",
+    "message",
+    "hint",
+    "ts"
+  ],
+  "title": "LlmErrorEvent",
+  "type": "object"
+}
+```
+
+### LlmRetryingEvent
+
+| Field | Type | Required |
+|---|---|---|
+| `event_id` | `string` | no |
+| `log_positions` | `object` | no |
+| `type` | `string` | no |
+| `run_id` | `string` | yes |
+| `step` | `integer` | yes |
+| `attempt` | `integer` | yes |
+| `delay_s` | `number` | yes |
+| `ts` | `string` | yes |
+
+```json
+{
+  "properties": {
+    "event_id": {
+      "title": "Event Id",
+      "type": "string"
+    },
+    "log_positions": {
+      "additionalProperties": {
+        "maxItems": 2,
+        "minItems": 2,
+        "prefixItems": [
+          {
+            "type": "integer"
+          },
+          {
+            "type": "integer"
+          }
+        ],
+        "type": "array"
+      },
+      "title": "Log Positions",
+      "type": "object"
+    },
+    "type": {
+      "const": "llm.retrying",
+      "default": "llm.retrying",
+      "title": "Type",
+      "type": "string"
+    },
+    "run_id": {
+      "title": "Run Id",
+      "type": "string"
+    },
+    "step": {
+      "title": "Step",
+      "type": "integer"
+    },
+    "attempt": {
+      "title": "Attempt",
+      "type": "integer"
+    },
+    "delay_s": {
+      "title": "Delay S",
+      "type": "number"
+    },
+    "ts": {
+      "title": "Ts",
+      "type": "string"
+    }
+  },
+  "required": [
+    "run_id",
+    "step",
+    "attempt",
+    "delay_s",
+    "ts"
+  ],
+  "title": "LlmRetryingEvent",
+  "type": "object"
+}
+```
+
+### LlmTextCompletedEvent
+
+| Field | Type | Required |
+|---|---|---|
+| `event_id` | `string` | no |
+| `log_positions` | `object` | no |
+| `type` | `string` | no |
+| `run_id` | `string` | yes |
+| `step` | `integer` | yes |
+| `text` | `string` | yes |
+| `ts` | `string` | yes |
+
+```json
+{
+  "properties": {
+    "event_id": {
+      "title": "Event Id",
+      "type": "string"
+    },
+    "log_positions": {
+      "additionalProperties": {
+        "maxItems": 2,
+        "minItems": 2,
+        "prefixItems": [
+          {
+            "type": "integer"
+          },
+          {
+            "type": "integer"
+          }
+        ],
+        "type": "array"
+      },
+      "title": "Log Positions",
+      "type": "object"
+    },
+    "type": {
+      "const": "llm.text_completed",
+      "default": "llm.text_completed",
+      "title": "Type",
+      "type": "string"
+    },
+    "run_id": {
+      "title": "Run Id",
+      "type": "string"
+    },
+    "step": {
+      "title": "Step",
+      "type": "integer"
+    },
+    "text": {
+      "title": "Text",
+      "type": "string"
+    },
+    "ts": {
+      "title": "Ts",
+      "type": "string"
+    }
+  },
+  "required": [
+    "run_id",
+    "step",
+    "text",
+    "ts"
+  ],
+  "title": "LlmTextCompletedEvent",
+  "type": "object"
+}
+```
+
+### PermissionDeniedEvent
+
+| Field | Type | Required |
+|---|---|---|
+| `event_id` | `string` | no |
+| `log_positions` | `object` | no |
+| `type` | `string` | no |
+| `run_id` | `string` | yes |
+| `tool_use_id` | `string` | yes |
+| `decision` | `string` | yes |
+| `ts` | `string` | yes |
+
+```json
+{
+  "properties": {
+    "event_id": {
+      "title": "Event Id",
+      "type": "string"
+    },
+    "log_positions": {
+      "additionalProperties": {
+        "maxItems": 2,
+        "minItems": 2,
+        "prefixItems": [
+          {
+            "type": "integer"
+          },
+          {
+            "type": "integer"
+          }
+        ],
+        "type": "array"
+      },
+      "title": "Log Positions",
+      "type": "object"
+    },
+    "type": {
+      "const": "permission.denied",
+      "default": "permission.denied",
+      "title": "Type",
+      "type": "string"
+    },
+    "run_id": {
+      "title": "Run Id",
+      "type": "string"
+    },
+    "tool_use_id": {
+      "title": "Tool Use Id",
+      "type": "string"
+    },
+    "decision": {
+      "title": "Decision",
+      "type": "string"
+    },
+    "ts": {
+      "title": "Ts",
+      "type": "string"
+    }
+  },
+  "required": [
+    "run_id",
+    "tool_use_id",
+    "decision",
+    "ts"
+  ],
+  "title": "PermissionDeniedEvent",
+  "type": "object"
+}
+```
+
+### PermissionGrantedEvent
+
+| Field | Type | Required |
+|---|---|---|
+| `event_id` | `string` | no |
+| `log_positions` | `object` | no |
+| `type` | `string` | no |
+| `run_id` | `string` | yes |
+| `tool_use_id` | `string` | yes |
+| `decision` | `string` | yes |
+| `ts` | `string` | yes |
+
+```json
+{
+  "properties": {
+    "event_id": {
+      "title": "Event Id",
+      "type": "string"
+    },
+    "log_positions": {
+      "additionalProperties": {
+        "maxItems": 2,
+        "minItems": 2,
+        "prefixItems": [
+          {
+            "type": "integer"
+          },
+          {
+            "type": "integer"
+          }
+        ],
+        "type": "array"
+      },
+      "title": "Log Positions",
+      "type": "object"
+    },
+    "type": {
+      "const": "permission.granted",
+      "default": "permission.granted",
+      "title": "Type",
+      "type": "string"
+    },
+    "run_id": {
+      "title": "Run Id",
+      "type": "string"
+    },
+    "tool_use_id": {
+      "title": "Tool Use Id",
+      "type": "string"
+    },
+    "decision": {
+      "title": "Decision",
+      "type": "string"
+    },
+    "ts": {
+      "title": "Ts",
+      "type": "string"
+    }
+  },
+  "required": [
+    "run_id",
+    "tool_use_id",
+    "decision",
+    "ts"
+  ],
+  "title": "PermissionGrantedEvent",
+  "type": "object"
+}
+```
+
+### PermissionRequestedEvent
+
+| Field | Type | Required |
+|---|---|---|
+| `event_id` | `string` | no |
+| `log_positions` | `object` | no |
+| `type` | `string` | no |
+| `run_id` | `string` | yes |
+| `tool_use_id` | `string` | yes |
+| `tool_name` | `string` | yes |
+| `params` | `object` | yes |
+| `param_preview` | `string` | yes |
+| `session_id` | `string` | yes |
+| `ts` | `string` | yes |
+
+```json
+{
+  "properties": {
+    "event_id": {
+      "title": "Event Id",
+      "type": "string"
+    },
+    "log_positions": {
+      "additionalProperties": {
+        "maxItems": 2,
+        "minItems": 2,
+        "prefixItems": [
+          {
+            "type": "integer"
+          },
+          {
+            "type": "integer"
+          }
+        ],
+        "type": "array"
+      },
+      "title": "Log Positions",
+      "type": "object"
+    },
+    "type": {
+      "const": "permission.requested",
+      "default": "permission.requested",
+      "title": "Type",
+      "type": "string"
+    },
+    "run_id": {
+      "title": "Run Id",
+      "type": "string"
+    },
+    "tool_use_id": {
+      "title": "Tool Use Id",
+      "type": "string"
+    },
+    "tool_name": {
+      "title": "Tool Name",
+      "type": "string"
+    },
+    "params": {
+      "additionalProperties": true,
+      "title": "Params",
+      "type": "object"
+    },
+    "param_preview": {
+      "title": "Param Preview",
+      "type": "string"
+    },
+    "session_id": {
+      "title": "Session Id",
+      "type": "string"
+    },
+    "ts": {
+      "title": "Ts",
+      "type": "string"
+    }
+  },
+  "required": [
+    "run_id",
+    "tool_use_id",
+    "tool_name",
+    "params",
+    "param_preview",
+    "session_id",
+    "ts"
+  ],
+  "title": "PermissionRequestedEvent",
+  "type": "object"
+}
+```
+
+### RuntimeEvent
+
+| Field | Type | Required |
+|---|---|---|
+| `event_id` | `string` | no |
+| `log_positions` | `object` | no |
+
+```json
+{
+  "properties": {
+    "event_id": {
+      "title": "Event Id",
+      "type": "string"
+    },
+    "log_positions": {
+      "additionalProperties": {
+        "maxItems": 2,
+        "minItems": 2,
+        "prefixItems": [
+          {
+            "type": "integer"
+          },
+          {
+            "type": "integer"
+          }
+        ],
+        "type": "array"
+      },
+      "title": "Log Positions",
+      "type": "object"
+    }
+  },
+  "title": "RuntimeEvent",
+  "type": "object"
+}
+```
+
+### SkillInvokedEvent
+
+| Field | Type | Required |
+|---|---|---|
+| `event_id` | `string` | no |
+| `log_positions` | `object` | no |
+| `type` | `string` | no |
+| `skill_name` | `string` | yes |
+| `arguments` | `string` | yes |
+| `run_id` | `string` | yes |
+| `session_id` | `string` | no |
+| `ts` | `string` | yes |
+
+```json
+{
+  "properties": {
+    "event_id": {
+      "title": "Event Id",
+      "type": "string"
+    },
+    "log_positions": {
+      "additionalProperties": {
+        "maxItems": 2,
+        "minItems": 2,
+        "prefixItems": [
+          {
+            "type": "integer"
+          },
+          {
+            "type": "integer"
+          }
+        ],
+        "type": "array"
+      },
+      "title": "Log Positions",
+      "type": "object"
+    },
+    "type": {
+      "const": "skill.invoked",
+      "default": "skill.invoked",
+      "title": "Type",
+      "type": "string"
+    },
+    "skill_name": {
+      "title": "Skill Name",
+      "type": "string"
+    },
+    "arguments": {
+      "title": "Arguments",
+      "type": "string"
+    },
+    "run_id": {
+      "title": "Run Id",
+      "type": "string"
+    },
+    "session_id": {
+      "default": "",
+      "title": "Session Id",
+      "type": "string"
+    },
+    "ts": {
+      "title": "Ts",
+      "type": "string"
+    }
+  },
+  "required": [
+    "skill_name",
+    "arguments",
+    "run_id",
+    "ts"
+  ],
+  "title": "SkillInvokedEvent",
+  "type": "object"
+}
+```
+
 ## Error Codes
 
 | Code | Name | Meaning |
@@ -2374,4 +3885,9 @@ Events written to `runs/<run_id>/events.jsonl` and forwarded over IPC to subscri
 | -32601 | Method Not Found | Unknown method |
 | -32602 | Invalid Params | Parameter validation failed |
 | -32603 | Internal Error | Handler raised an unhandled exception |
-| -32000 | Application Error | e.g. another run already in progress |
+| -32000 | Application Error | Application-specific failure |
+| -32001 | Unauthorized | Missing or invalid local IPC credential |
+| -32010 | Session Not Found | Unknown session or no prior chat |
+| -32011 | Session Closed | Session no longer accepts messages |
+| -32012 | Session Busy | Active or unfinished task |
+| -32030 | Recovery Review Required | Invalid checkpoint or unconfirmed recovery |

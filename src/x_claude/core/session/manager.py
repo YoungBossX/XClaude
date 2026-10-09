@@ -91,6 +91,13 @@ class SessionManager:
         self._get_session(sid)
         return sorted(self._store.runs_dir(sid).glob("*/events.jsonl"))
 
+    # 只读分页接口不恢复任务、不更改模型上下文，并验证会话身份
+    def history_page(
+        self, sid: str, cursor: str | None, limit: int,
+    ) -> tuple[list[dict[str, Any]], str | None]:
+        self._get_session(sid)
+        return self._store.history_page(sid, cursor, limit, max_chars=16000)
+
     # 从实际会话存储查找指定运行的日志，精确匹配目录名而不解释用户输入为路径或通配符
     def run_event_path(self, run_id: str) -> Path | None:
         return next((path for path in self._store.root.glob("*/runs/*/events.jsonl")

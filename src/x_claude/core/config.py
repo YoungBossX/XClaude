@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import os
 import tomllib
 from dataclasses import dataclass, field
@@ -29,6 +30,10 @@ class LoggingConfig:
 @dataclass
 class AgentConfig:
     max_steps: int = _DEFAULT_MAX_STEPS
+    max_concurrent_llm: int = 4
+    max_tasks: int = 32
+    max_total_tokens: int = 500_000
+    max_runtime_s: float = 1800.0
 
 
 @dataclass
@@ -86,6 +91,20 @@ class XConfig:
     mcp: McpConfig = field(default_factory=McpConfig)
 
 
+# 校验统一资源限制，零预算或零时限显式禁用该项，布尔值和非有限数值一律拒绝
+def _set_agent_limit(config: AgentConfig, key: str, value: object) -> None:
+    if key == "max_runtime_s":
+        if (not isinstance(value, (int, float)) or isinstance(value, bool)
+                or not math.isfinite(value) or value < 0):
+            raise SystemExit(f"Config error: agent.{key} must be a finite non-negative number")
+        config.max_runtime_s = float(value)
+    else:
+        minimum = 0 if key == "max_total_tokens" else 1
+        if type(value) is not int or value < minimum:
+            raise SystemExit(f"Config error: agent.{key} must be an integer >= {minimum}")
+        setattr(config, key, value)
+
+
 # 构建并返回运行时配置：默认值 → 全局 TOML → 项目本地 TOML → .env → 系统环境变量（后者优先级最高）
 def get_config() -> XConfig:
     config = XConfig()
@@ -118,7 +137,9 @@ def get_config() -> XConfig:
 
 # 将已解析的 TOML 根表写入 config；未知小节或类型错误时退出进程
 def _apply_toml(config: XConfig, data: dict[str, Any]) -> None:
-    unknown = set(data.keys()) - {"core", "logging", "agent", "llm", "trace", "permission", "compaction", "mcp"}
+    unknown = set(data.keys()) - {
+        "core", "logging", "agent", "llm", "trace", "permission", "compaction", "mcp",
+    }
     if unknown:
         raise SystemExit(f"Unknown top-level config keys: {', '.join(sorted(unknown))}")
 
@@ -158,7 +179,9 @@ def _apply_toml(config: XConfig, data: dict[str, Any]) -> None:
         agent = data["agent"]
         if not isinstance(agent, dict):
             raise SystemExit("Config error: [agent] must be a table")
-        unknown_agent: set[str] = set(agent.keys()) - {"max_steps"}
+        unknown_agent: set[str] = set(agent.keys()) - {
+            "max_steps", "max_concurrent_llm", "max_tasks", "max_total_tokens", "max_runtime_s",
+        }
         if unknown_agent:
             raise SystemExit(f"Unknown [agent] keys: {', '.join(sorted(unknown_agent))}")
         if "max_steps" in agent:
@@ -166,6 +189,9 @@ def _apply_toml(config: XConfig, data: dict[str, Any]) -> None:
             if not isinstance(val, int) or val <= 0:
                 raise SystemExit("Config error: agent.max_steps must be a positive integer")
             config.agent.max_steps = val
+        for key in ("max_concurrent_llm", "max_tasks", "max_total_tokens", "max_runtime_s"):
+            if key in agent:
+                _set_agent_limit(config.agent, key, agent[key])
 
     if "llm" in data:
         llm = data["llm"]
@@ -230,7 +256,9 @@ def _apply_toml(config: XConfig, data: dict[str, Any]) -> None:
         comp = data["compaction"]
         if not isinstance(comp, dict):
             raise SystemExit("Config error: [compaction] must be a table")
-        unknown_comp: set[str] = set(comp.keys()) - {"auto_threshold", "tool_result_limit", "tool_result_keep"}
+        unknown_comp: set[str] = set(comp.keys()) - {
+            "auto_threshold", "tool_result_limit", "tool_result_keep",
+        }
         if unknown_comp:
             raise SystemExit(f"Unknown [compaction] keys: {', '.join(sorted(unknown_comp))}")
         if "auto_threshold" in comp:
@@ -241,12 +269,16 @@ def _apply_toml(config: XConfig, data: dict[str, Any]) -> None:
         if "tool_result_limit" in comp:
             val = comp["tool_result_limit"]
             if not isinstance(val, int) or val <= 0:
-                raise SystemExit("Config error: compaction.tool_result_limit must be a positive integer")
+                raise SystemExit(
+                    "Config error: compaction.tool_result_limit must be a positive integer"
+                )
             config.compaction.tool_result_limit = val
         if "tool_result_keep" in comp:
             val = comp["tool_result_keep"]
             if not isinstance(val, int) or val <= 0:
-                raise SystemExit("Config error: compaction.tool_result_keep must be a positive integer")
+                raise SystemExit(
+                    "Config error: compaction.tool_result_keep must be a positive integer"
+                )
             config.compaction.tool_result_keep = val
 
     if "mcp" in data:
@@ -267,7 +299,9 @@ def _apply_toml(config: XConfig, data: dict[str, Any]) -> None:
                 raise SystemExit(f"Config error: mcp.servers[{i}].name must be a non-empty string")
             transport = srv.get("transport", "stdio")
             if transport not in ("stdio", "tcp"):
-                raise SystemExit(f"Config error: mcp.servers[{i}].transport must be 'stdio' or 'tcp'")
+                raise SystemExit(
+                    f"Config error: mcp.servers[{i}].transport must be 'stdio' or 'tcp'"
+                )
             s = McpServerConfig(name=name, transport=transport)
             if "command" in srv:
                 val = srv["command"]
@@ -299,6 +333,14 @@ def _apply_toml(config: XConfig, data: dict[str, Any]) -> None:
 
 # 用 X_* 环境变量覆盖 config 中对应字段（若变量已设置）
 def _apply_env(config: XConfig) -> None:
+    for key in ("max_concurrent_llm", "max_tasks", "max_total_tokens", "max_runtime_s"):
+        name = "X_" + key.upper()
+        if name in os.environ:
+            try:
+                value = float(os.environ[name]) if key == "max_runtime_s" else int(os.environ[name])
+            except ValueError:
+                raise SystemExit(f"Config error: {name} must be a number") from None
+            _set_agent_limit(config.agent, key, value)
     host = os.environ.get("X_HOST")
     if host is not None:
         config.host = host
@@ -383,7 +425,8 @@ def _apply_env(config: XConfig) -> None:
             compact_threshold_val = float(compact_threshold)
             if not (0.0 <= compact_threshold_val <= 1.0):
                 raise SystemExit(
-                    f"Config error: X_COMPACT_THRESHOLD must be between 0 and 1, got: {compact_threshold!r}"
+                    "Config error: X_COMPACT_THRESHOLD must be between 0 and 1, "
+                    f"got: {compact_threshold!r}"
                 )
             config.compaction.auto_threshold = compact_threshold_val
         except ValueError:
@@ -397,12 +440,14 @@ def _apply_env(config: XConfig) -> None:
             compact_tool_limit_val = int(compact_tool_limit)
             if compact_tool_limit_val <= 0:
                 raise SystemExit(
-                    f"Config error: X_COMPACT_TOOL_LIMIT must be a positive integer, got: {compact_tool_limit!r}"
+                    "Config error: X_COMPACT_TOOL_LIMIT must be a positive integer, "
+                    f"got: {compact_tool_limit!r}"
                 )
             config.compaction.tool_result_limit = compact_tool_limit_val
         except ValueError:
             raise SystemExit(
-                f"Config error: X_COMPACT_TOOL_LIMIT must be an integer, got: {compact_tool_limit!r}"
+                "Config error: X_COMPACT_TOOL_LIMIT must be an integer, "
+                f"got: {compact_tool_limit!r}"
             )
 
     compact_tool_keep = os.environ.get("X_COMPACT_TOOL_KEEP")
@@ -411,7 +456,8 @@ def _apply_env(config: XConfig) -> None:
             compact_tool_keep_val = int(compact_tool_keep)
             if compact_tool_keep_val <= 0:
                 raise SystemExit(
-                    f"Config error: X_COMPACT_TOOL_KEEP must be a positive integer, got: {compact_tool_keep!r}"
+                    "Config error: X_COMPACT_TOOL_KEEP must be a positive integer, "
+                    f"got: {compact_tool_keep!r}"
                 )
             config.compaction.tool_result_keep = compact_tool_keep_val
         except ValueError:

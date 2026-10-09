@@ -28,7 +28,7 @@ async def test_emit_writes_record_to_file(tmp_path: Path) -> None:
     writer.emit(_record())
     await writer.stop()
 
-    lines = path.read_text().splitlines()
+    lines = path.read_text(encoding="utf-8").splitlines()
     assert len(lines) == 1
     parsed = json.loads(lines[0])
     assert parsed["direction"] == "CORE"
@@ -48,7 +48,7 @@ async def test_emit_multiple_records_in_order(tmp_path: Path) -> None:
     writer.emit(_record("LLM→CORE", "api_response"))
     await writer.stop()
 
-    lines = path.read_text().splitlines()
+    lines = path.read_text(encoding="utf-8").splitlines()
     assert len(lines) == 3
     assert json.loads(lines[0])["direction"] == "CLIENT→CORE"
     assert json.loads(lines[1])["direction"] == "CORE"

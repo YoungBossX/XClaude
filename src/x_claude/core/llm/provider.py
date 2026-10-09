@@ -10,7 +10,13 @@ from typing import Any
 import anthropic
 import httpx
 
-from x_claude.core.bus.events import LlmModelSelectedEvent, LlmTokenEvent, LlmUsageEvent
+from x_claude.core.bus.events import (
+    LlmModelSelectedEvent,
+    LlmRetryingEvent,
+    LlmTextCompletedEvent,
+    LlmTokenEvent,
+    LlmUsageEvent,
+)
 from x_claude.core.events.bus import EventBus
 from x_claude.core.llm.types import LlmResponse, ToolCallBlock, UsageStats
 
@@ -109,9 +115,7 @@ class AnthropicProvider:
             try:
                 async with self._client.messages.stream(**kwargs) as stream:
                     async for text in stream.text_stream:
-                        # Only publish token events on the first attempt to avoid TUI duplicates
-                        if attempt == 1:
-                            await bus.publish(LlmTokenEvent(run_id=run_id, token=text, ts=_now()))
+                        await bus.publish(LlmTokenEvent(run_id=run_id, token=text, ts=_now()))
                         text_parts.append(text)
                     final_message = await stream.get_final_message()
                 break  # success
@@ -127,9 +131,15 @@ class AnthropicProvider:
                     "stream dropped (attempt %d/%d) run_id=%s step=%d: %s — retrying in %.0fs",
                     attempt, _MAX_STREAM_RETRIES, run_id, step, exc, delay,
                 )
+                await bus.publish(LlmRetryingEvent(
+                    run_id=run_id, step=step, attempt=attempt + 1, delay_s=delay, ts=_now(),
+                ))
                 await asyncio.sleep(delay)
 
         assert final_message is not None
+        await bus.publish(LlmTextCompletedEvent(
+            run_id=run_id, step=step, text="".join(text_parts), ts=_now(),
+        ))
 
         usage = final_message.usage
         cache_read: int = getattr(usage, "cache_read_input_tokens", 0) or 0
@@ -158,7 +168,9 @@ class AnthropicProvider:
                 )
             elif block.type == "thinking":
                 # thinking blocks must be passed back verbatim in subsequent requests
-                thinking_blocks.append({"type": "thinking", "thinking": block.thinking, "signature": block.signature})
+                thinking_blocks.append({
+                    "type": "thinking", "thinking": block.thinking, "signature": block.signature,
+                })
 
         return LlmResponse(
             stop_reason=final_message.stop_reason or "end_turn",

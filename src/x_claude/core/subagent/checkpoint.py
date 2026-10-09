@@ -76,6 +76,7 @@ class BackgroundRecord(BaseModel):
     tools: list[str]
     runtime_signature: str | None = None
     model: str = ""
+    budget_root_id: str = Field(default="", pattern=r"^[A-Za-z0-9_-]*$")
     phase: Phase = "ready"
     state: State = "running"
     context: ContextSnapshot

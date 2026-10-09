@@ -37,6 +37,8 @@ from x_claude.core.bus.commands import (
     SessionCreateResult,
     SessionGetHistoryCommand,
     SessionGetHistoryResult,
+    SessionHistoryPageCommand,
+    SessionHistoryPageResult,
     SessionRecoverCommand,
     SessionRecoverResult,
     SessionResumeCommand,
@@ -52,6 +54,7 @@ from x_claude.core.logging_setup import setup_logging
 from x_claude.core.mcp.server import McpServerManager
 from x_claude.core.permissions.manager import PermissionManager
 from x_claude.core.permissions.storage import load_policy_file
+from x_claude.core.resources import LimitedProvider
 from x_claude.core.runner import AgentRunner
 from x_claude.core.runs import events_file, new_run_id
 from x_claude.core.session import SessionManager, SessionStore
@@ -168,6 +171,18 @@ class CoreApp:
         messages = await self._sessions.get_history(cmd.session_id)
         return SessionGetHistoryResult(messages=messages)
 
+    # 按页读取保存的对话，不把历史浏览转换成新消息或恢复请求
+    async def _session_history_page_handler(
+        self, params: dict[str, Any],
+    ) -> SessionHistoryPageResult:
+        assert self._sessions is not None
+        cmd = SessionHistoryPageCommand.model_validate(params)
+        try:
+            messages, cursor = self._sessions.history_page(cmd.session_id, cmd.cursor, cmd.limit)
+        except ValueError as exc:
+            raise HandlerError(INVALID_PARAMS, str(exc)) from None
+        return SessionHistoryPageResult(messages=messages, next_cursor=cursor)
+
     # 接收客户端权限审批响应，resolve 对应挂起的 Future
     async def _permission_respond_handler(self, params: dict[str, Any]) -> PermissionRespondResult:
         cmd = PermissionRespondCommand.model_validate(params)
@@ -224,6 +239,8 @@ class CoreApp:
 
         assert self._broadcaster is not None
         replayed_count = 0
+        offsets: dict[str, int] = {}
+        truncated: list[bool] = []
         sub_id = self._broadcaster.subscribe(
             writer, cmd.topics, cmd.scope,
             replaying=cmd.replay_from_run is not None or cmd.replay_session,
@@ -233,6 +250,8 @@ class CoreApp:
                 replayed_ids: set[str] = set()
                 replayed_count = await self._replay_session_events(
                     cmd.scope[8:], writer, cmd.topics, replayed_ids,
+                    cmd.replay_offsets, offsets, cmd.replay_tail_runs, cmd.replay_tail_bytes,
+                    truncated,
                 )
                 await self._broadcaster.finish_replay(writer, replayed_ids)
             elif cmd.replay_from_run is not None:
@@ -259,29 +278,59 @@ class CoreApp:
         except BaseException:
             self._broadcaster.unsubscribe(writer)
             raise
-        return EventSubscribeResult(subscription_id=sub_id, replayed_count=replayed_count)
+        return EventSubscribeResult(
+            subscription_id=sub_id, replayed_count=replayed_count,
+            replay_offsets=offsets, history_truncated=bool(truncated),
+        )
 
     # 按时间合并会话日志，去重父子日志的镜像事件，实时事件在回放期间暂存
     async def _replay_session_events(
         self, sid: str, writer: asyncio.StreamWriter, topics: list[str], seen: set[str],
+        after: dict[str, int] | None = None, offsets: dict[str, int] | None = None,
+        tail_runs: int = 0, tail_bytes: int = 0, truncated: list[bool] | None = None,
     ) -> int:
         assert self._sessions is not None and self._broadcaster is not None
+        after = after or {}
+        offsets = offsets if offsets is not None else {}
 
         # 只读取订阅开始时已落盘的完整行，不把后续写入混入回放快照
         def read_events(path: Path, size: int) -> Generator[dict[str, Any], None, None]:
             with path.open("rb") as stream:
+                start = after.get(path.parent.name, 0)
+                if start > size:
+                    start = 0
+                if start:
+                    stream.seek(start - 1)
+                    if stream.read(1) != b"\n":
+                        start = 0
+                stream.seek(start)
+                if not start and tail_bytes and size > tail_bytes:
+                    stream.seek(size - tail_bytes)
+                    stream.readline()
+                    if truncated is not None:
+                        truncated.append(True)
+                offsets[path.parent.name] = stream.tell()
                 while stream.tell() < size:
+                    start = stream.tell()
                     line = stream.readline(size - stream.tell())
                     if not line.endswith(b"\n"):
                         break
+                    offsets[path.parent.name] = stream.tell()
                     try:
                         item = json.loads(line)
                     except (ValueError, UnicodeError):
                         continue
                     if isinstance(item, dict):
-                        yield {**item, "session_id": sid}
+                        yield {**item, "session_id": sid,
+                               "log_positions": {path.parent.name: (start, stream.tell())}}
 
         paths = self._sessions.event_paths(sid)
+        if tail_runs and len(paths) > tail_runs:
+            omitted, paths = paths[:-tail_runs], paths[-tail_runs:]
+            for path in omitted:
+                offsets[path.parent.name] = path.stat().st_size
+            if truncated is not None:
+                truncated.append(True)
         streams = [read_events(path, path.stat().st_size) for path in paths]
         count = 0
         try:
@@ -386,8 +435,11 @@ class CoreApp:
             )
             self._broadcaster = IpcEventBroadcaster(trace=self._trace)
             self._bus.subscribe(self._broadcaster.handle)
-            compact_provider = AnthropicProvider(
-                self._config.llm.default_model, context_window=self._config.llm.context_window,
+            model_gate = asyncio.Semaphore(self._config.agent.max_concurrent_llm)
+            compact_provider = LimitedProvider(
+                AnthropicProvider(
+                    self._config.llm.default_model, context_window=self._config.llm.context_window,
+                ), model_gate,
             )
             self._mcp_manager = McpServerManager()
             cleanup.push_async_callback(self._mcp_manager.stop_all)
@@ -399,6 +451,7 @@ class CoreApp:
                     self._config,  # type: ignore[arg-type]
                     bus=self._bus, trace=self._trace,
                     permission_manager=self._permission_manager, mcp_manager=self._mcp_manager,
+                    model_gate=model_gate,
                 ),
                 bus=self._bus, provider=compact_provider, config=self._config,
             )
@@ -417,6 +470,7 @@ class CoreApp:
                 ("session.resume", self._session_resume_handler),
                 ("session.send_message", self._session_send_handler),
                 ("session.get_history", self._session_history_handler),
+                ("session.history_page", self._session_history_page_handler),
                 ("session.close", self._session_close_handler),
                 ("session.clear", self._session_clear_handler),
                 ("session.recover", self._session_recover_handler),

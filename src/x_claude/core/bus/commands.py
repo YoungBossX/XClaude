@@ -33,11 +33,16 @@ class EventSubscribeCommand(BaseModel):
     scope: str = "global"      # "global" | "run:<run_id>" | "session:<session_id>"
     replay_from_run: str | None = None  # 设置则先从 events.jsonl 回放历史再接实时流
     replay_session: bool = False  # 仅 session scope 可补全该会话所有运行的事件
+    replay_offsets: dict[str, Annotated[int, Field(ge=0)]] = Field(default_factory=dict)
+    replay_tail_runs: int = Field(default=0, ge=0, le=100)
+    replay_tail_bytes: int = Field(default=0, ge=0, le=1_048_576)
 
 
 class EventSubscribeResult(BaseModel):
     subscription_id: str
     replayed_count: int = 0
+    replay_offsets: dict[str, int] = Field(default_factory=dict)
+    history_truncated: bool = False
 
 
 class SessionCreateCommand(BaseModel):
@@ -87,6 +92,18 @@ class SessionGetHistoryCommand(BaseModel):
 
 class SessionGetHistoryResult(BaseModel):
     messages: list[dict[str, Any]]
+
+
+class SessionHistoryPageCommand(BaseModel):
+    type: Literal["session.history_page"] = "session.history_page"
+    session_id: str
+    cursor: str | None = Field(default=None, max_length=100)
+    limit: int = Field(default=20, ge=1, le=100)
+
+
+class SessionHistoryPageResult(BaseModel):
+    messages: list[dict[str, Any]]
+    next_cursor: str | None = None
 
 
 class SessionCloseCommand(BaseModel):
@@ -169,6 +186,7 @@ Command = Annotated[
     | SessionResumeCommand
     | SessionSendMessageCommand
     | SessionGetHistoryCommand
+    | SessionHistoryPageCommand
     | SessionCloseCommand
     | SessionClearCommand
     | PermissionRespondCommand

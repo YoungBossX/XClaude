@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import json
 import logging
+from collections.abc import Iterator
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, BinaryIO
 from uuid import uuid4
 
 from x_claude.core.atomic_file import atomic_write_bytes
@@ -38,6 +39,69 @@ class SessionStore:
     # 返回指定 session 下的 runs 目录路径
     def runs_dir(self, sid: str) -> Path:
         return self.session_dir(sid) / "runs"
+
+    # 分块逆向读取完整 JSONL 行，历史分页不需要把整个会话文件加载到内存
+    @staticmethod
+    def _previous_lines(stream: BinaryIO, end: int) -> Iterator[tuple[int, bytes]]:
+        position, buffer = end, b""
+        while position:
+            start = max(0, position - 65536)
+            stream.seek(start)
+            buffer = stream.read(position - start) + buffer
+            position = start
+            boundary = len(buffer)
+            while True:
+                split = buffer.rfind(b"\n", 0, boundary - 1)
+                if split < 0:
+                    break
+                yield position + split + 1, buffer[split + 1:boundary]
+                boundary = split + 1
+            buffer = buffer[:boundary]
+        if buffer.strip():
+            yield 0, buffer
+
+    # 使用文件版本与字节偏移翻页，原子替换或压缩后拒绝旧游标，避免跳页或错读
+    def history_page(
+        self, sid: str, cursor: str | None, limit: int,
+        *, max_chars: int | None = None,
+    ) -> tuple[list[dict[str, Any]], str | None]:
+        path = self.session_dir(sid) / "thread.jsonl"
+        if not path.exists():
+            return [], None
+        messages: list[dict[str, Any]] = []
+        with path.open("rb") as stream:
+            import os
+
+            stat = os.fstat(stream.fileno())
+            revision = f"{stat.st_mtime_ns}-{stat.st_size}"
+            end = stat.st_size
+            if cursor is not None:
+                version, raw_offset = cursor.rsplit(":", 1)
+                if version != revision:
+                    raise ValueError("对话已更新或压缩，请重新打开 /history 查看最新历史。")
+                end = int(raw_offset)
+                if not 0 <= end <= stat.st_size:
+                    raise ValueError("invalid history cursor")
+            offset = end
+            for start, line in self._previous_lines(stream, end):
+                offset = start
+                try:
+                    row = json.loads(line)
+                except (ValueError, UnicodeError):
+                    continue
+                if isinstance(row, dict) and row.get("role") in ("user", "assistant"):
+                    content = row.get("content", "")
+                    if max_chars is not None:
+                        text = (content if isinstance(content, str)
+                                else json.dumps(content, ensure_ascii=False))
+                        if len(text) > max_chars:
+                            suffix = "\n[本条过长，显示已截断；完整记录保留在本机会话文件]"
+                            content = text[:max(0, max_chars - len(suffix))] + suffix
+                    messages.append({"role": row["role"], "content": content})
+                if len(messages) >= limit:
+                    break
+        messages.reverse()
+        return messages, f"{revision}:{offset}" if offset else None
 
     # 将 session meta 写入 meta.json
     def write_meta(self, session: Session) -> None:

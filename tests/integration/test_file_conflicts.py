@@ -35,6 +35,7 @@ async def test_background_agents_merge_after_visible_conflict(tmp_path: Path) ->
     b_merged = asyncio.Event()
     readers: set[str] = set()
     failures: list = []
+    finished_versions: dict[str, dict[str, str | None]] = {}
 
     class Provider:
         # 两个子任务读相同原文，B 在 A 提交后尝试旧版本，再读新内容合并
@@ -86,6 +87,10 @@ async def test_background_agents_merge_after_visible_conflict(tmp_path: Path) ->
                         b_merged.set()
                 if getattr(event, "type", "") == "tool.call_failed":
                     failures.append(event)
+                if getattr(event, "type", "") == "subagent.finished":
+                    entry = manager._runners[event.session_id]._task_registry.get(event.run_id)
+                    assert entry is not None
+                    finished_versions[event.run_id] = dict(entry[1].file_versions)
 
             bus.subscribe(observe)
             app = XTuiApp(cfg.host, cfg.port)
@@ -112,7 +117,9 @@ async def test_background_agents_merge_after_visible_conflict(tmp_path: Path) ->
                 for _, ctx in tasks:
                     path = store.runs_dir(sid) / ctx.run_id / "background.json"
                     saved = BackgroundCheckpoint.load(path, sid).record.context
-                    assert saved.file_versions == ctx.file_versions and saved.file_versions
+                    assert saved.file_versions == finished_versions[ctx.run_id] and saved.file_versions
+                cached = manager._runners[sid]._task_registry.all()
+                assert all(not ctx.file_versions and not ctx.messages for _, ctx in cached)
 
 
 # 功能：验证主任务停机续跑保留读取版本，文件未变可写，停机期间被修改则拒绝旧写入

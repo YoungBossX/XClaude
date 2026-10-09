@@ -21,6 +21,7 @@ from x_claude.core.context import ExecutionContext
 from x_claude.core.events.bus import EventBus
 from x_claude.core.events.writer import EventWriter
 from x_claude.core.loop import AgentLoop
+from x_claude.core.resources import ResourceLimitExceeded, TaskBudget
 from x_claude.core.runs import new_run_id
 from x_claude.core.subagent.checkpoint import (
     BackgroundCheckpoint,
@@ -109,6 +110,7 @@ class SpawnAgentTool(BaseTool):
         depth: int = 0,
         config: XConfig | None = None,
         mcp_tools: Sequence[BaseTool] | None = None,
+        budget: TaskBudget | None = None,
     ) -> None:
         self._provider = provider
         self._parent_bus = parent_bus
@@ -116,11 +118,13 @@ class SpawnAgentTool(BaseTool):
         self._permission_manager = permission_manager
         self._max_steps = max_steps
         self._task_registry = task_registry
+        self._task_registry.bind_storage(runs_dir, session_id)
         self._runs_dir = runs_dir
         self._session_id = session_id
         self._depth = depth
         self._config = config or XConfig()
         self._mcp_tools = list(mcp_tools or [])
+        self._budget = budget
 
     # 派生子 agent，前台时阻塞直到完成并返回结果，后台时立即返回 run_id
     async def invoke(self, params: dict[str, object]) -> ToolResult:
@@ -138,6 +142,12 @@ class SpawnAgentTool(BaseTool):
             profile = _profile_loader.load(p.subagent_type)
 
         child_run_id = new_run_id()
+        if self._budget is not None:
+            try:
+                self._budget.register(child_run_id)
+            except ResourceLimitExceeded as exc:
+                return ToolResult(content=f"{exc.code}: {exc}", is_error=True,
+                                  error_type="runtime_error")
         child_context = ExecutionContext(
             run_id=child_run_id,
             goal=p.prompt,
@@ -165,6 +175,7 @@ class SpawnAgentTool(BaseTool):
                 tools=[str(schema["name"]) for schema in child_registry.tool_schemas()],
                 runtime_signature=runtime_signature(self._config, child_registry.tool_schemas()),
                 model=self._config.llm.default_model,
+                budget_root_id=self._budget.root_id if self._budget is not None else "",
                 context=ContextSnapshot.capture(child_context),
             ))
             checkpoint.save(child_context, "ready")
@@ -185,6 +196,7 @@ class SpawnAgentTool(BaseTool):
             tool_result_keep=self._config.compaction.tool_result_keep,
             context_window=self._config.llm.context_window or 200_000,
             checkpoint=checkpoint.save if checkpoint is not None else None,
+            budget=self._budget,
         )
 
         await self._parent_bus.publish(
@@ -247,7 +259,10 @@ class SpawnAgentTool(BaseTool):
             try:
                 await loop.run(context)
                 if checkpoint is not None:
-                    checkpoint.save(context, "finished")
+                    if checkpoint.record.phase == "tools" and checkpoint.pending_tools():
+                        checkpoint.interrupt(suspend=True)
+                    else:
+                        checkpoint.save(context, "finished")
             except asyncio.CancelledError:
                 suspend = self._task_registry.suspending
                 context.mark_failed("suspended" if suspend else "cancelled")
@@ -321,6 +336,10 @@ class SpawnAgentTool(BaseTool):
                     state="blocked", step=context.step, message=context.reason or "", ts=_now(),
                 ), isolate_errors=True)
                 return
+            # 验证通过且模型就绪后重建工具，嵌套派生必须继承恢复后的模型和预算
+            registry = self._build_child_registry(
+                child_bus, record.run_id, None, allowed_tools=record.tools,
+            )
             context.status = "running"
             context.reason = None
 
@@ -342,6 +361,7 @@ class SpawnAgentTool(BaseTool):
                 tool_result_keep=self._config.compaction.tool_result_keep,
                 context_window=self._config.llm.context_window or 200_000,
                 checkpoint=checkpoint.save,
+                budget=self._budget,
             )
             await self._parent_bus.publish(SubagentStartedEvent(
                 run_id=record.run_id, parent_run_id=record.parent_run_id,
@@ -414,6 +434,7 @@ class SpawnAgentTool(BaseTool):
                 depth=self._depth + 1,
                 config=self._config,
                 mcp_tools=self._mcp_tools,
+                budget=self._budget,
             )
             if _allowed("spawn_agent"):
                 registry.register(nested)

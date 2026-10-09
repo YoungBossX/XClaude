@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, cast
+from weakref import WeakValueDictionary
 
 from pydantic import BaseModel
 
@@ -27,6 +28,7 @@ from x_claude.core.loop import AgentLoop
 from x_claude.core.mcp.server import McpServerManager
 from x_claude.core.memory.loader import load_context_file
 from x_claude.core.permissions.manager import PermissionManager
+from x_claude.core.resources import LimitedProvider, TaskBudget, budget_root
 from x_claude.core.runs import RUNS_DIR, new_run_id
 from x_claude.core.session.model import Session
 from x_claude.core.session.store import SessionStore
@@ -80,6 +82,7 @@ class AgentRunner:
         trace: TraceWriter | None = None,
         permission_manager: PermissionManager | None = None,
         mcp_manager: McpServerManager | None = None,
+        model_gate: asyncio.Semaphore | None = None,
     ) -> None:
         self._config = config
         self._bus = bus
@@ -89,6 +92,8 @@ class AgentRunner:
         self._trace = trace
         self._permission_manager = permission_manager
         self._mcp_manager = mcp_manager
+        self._model_gate = model_gate or asyncio.Semaphore(config.agent.max_concurrent_llm)
+        self._budgets: WeakValueDictionary[str, TaskBudget] = WeakValueDictionary()
         # 跨 run 共享的后台 subagent 任务注册表
         self._task_registry = BackgroundTaskRegistry()
         self._recovery_lock = asyncio.Lock()
@@ -173,7 +178,7 @@ class AgentRunner:
                 self._root_checkpoint = checkpoint
 
     # 惰性创建或装饰模型客户端，恢复已完成结果时不要求创建模型客户端
-    def _get_provider(self) -> LLMProvider:
+    def _get_provider(self, budget: TaskBudget | None = None) -> LLMProvider:
         provider: LLMProvider = self._provider or AnthropicProvider(
             self._config.llm.default_model, context_window=self._config.llm.context_window,
         )
@@ -181,7 +186,19 @@ class AgentRunner:
             provider = TracingProvider(
                 provider, self._trace, include_payload=self._config.trace.include_llm_payload,
             )
-        return provider
+        return (LimitedProvider(provider, self._model_gate, budget)
+                if budget is not None else provider)
+
+    # 同一根任务的前台和后台子任务共用一份预算对象，重启时从原子账本恢复
+    def _budget_for(self, run_id: str, runs_dir: Path, parent_id: str = "") -> TaskBudget:
+        root_id = budget_root(runs_dir, run_id, parent_id)
+        budget = self._budgets.get(root_id)
+        if budget is None:
+            budget = TaskBudget(
+                root_id, self._config.agent, runs_dir / root_id / "budget.json",
+            )
+            self._budgets[root_id] = budget
+        return budget
 
     # 恢复本会话保存的后台任务，串行登记避免重连与新消息同时触发重复续跑
     async def restore_background(self, session: Session, store: SessionStore) -> None:
@@ -206,6 +223,7 @@ class AgentRunner:
         self, session: Session, store: SessionStore, start_gate: asyncio.Event,
     ) -> None:
         runs_dir = store.runs_dir(session.id)
+        self._task_registry.bind_storage(runs_dir, session.id)
         bus = self._bus or EventBus()
         for path in sorted(runs_dir.glob("*/background.json")):
             entry = self._task_registry.get(path.parent.name)
@@ -233,17 +251,21 @@ class AgentRunner:
                 ), isolate_errors=True)
                 continue
             record = checkpoint.record
-            tool = SpawnAgentTool(
-                provider=self._provider, parent_bus=bus, parent_run_id=record.parent_run_id,
-                permission_manager=self._permission_manager,
-                max_steps=record.context.max_steps, task_registry=self._task_registry,
-                runs_dir=runs_dir, session_id=session.id, depth=record.depth,
-                config=self._config,
-                mcp_tools=self._mcp_manager.get_tools() if self._mcp_manager else [],
-            )
             try:
+                budget = (self._budget_for(record.run_id, runs_dir, record.parent_run_id)
+                          if record.context.status == "running" else None)
+                tool = SpawnAgentTool(
+                    provider=None, parent_bus=bus, parent_run_id=record.parent_run_id,
+                    permission_manager=self._permission_manager,
+                    max_steps=record.context.max_steps, task_registry=self._task_registry,
+                    runs_dir=runs_dir, session_id=session.id, depth=record.depth,
+                    config=self._config,
+                    mcp_tools=self._mcp_manager.get_tools() if self._mcp_manager else [],
+                    budget=budget,
+                )
                 await tool.restore(
-                    checkpoint, provider_factory=self._get_provider, start_gate=start_gate,
+                    checkpoint, provider_factory=lambda: self._get_provider(budget),
+                    start_gate=start_gate,
                 )
             except (Exception, SystemExit) as exc:
                 logging.getLogger(__name__).exception(
@@ -354,6 +376,7 @@ class AgentRunner:
         child_runs_dir: Path | None = None,
         session_id: str = "",
         tool_whitelist: list[str] | None = None,
+        budget: TaskBudget | None = None,
     ) -> ToolRegistry:
         allowed: set[str] | None = set(tool_whitelist) if tool_whitelist is not None else None
 
@@ -386,6 +409,7 @@ class AgentRunner:
                         parent_run_id=run_id,
                         permission_manager=self._permission_manager,
                         max_steps=self._config.agent.max_steps,
+                        budget=budget,
                         task_registry=self._task_registry,
                         runs_dir=runs_dir,
                         session_id=session_id,
@@ -429,6 +453,8 @@ class AgentRunner:
             history = [{"role": "user", "content": goal}]
             notes = ""
         run_path.mkdir(parents=True, exist_ok=True)
+        budget = (self._budget_for(run_id, run_path.parent)
+                  if checkpoint is None or checkpoint.record.context.status == "running" else None)
 
         global_ctx = load_context_file(Path("~/.x/context.md").expanduser())
         project_ctx = load_context_file(Path(".x/context.md"))
@@ -472,6 +498,7 @@ class AgentRunner:
             )
             checkpoint = BackgroundCheckpoint(run_path / "root.json", BackgroundRecord(
                 kind="root", run_id=run_id, session_id=session.id, parent_run_id="",
+                budget_root_id=budget.root_id if budget is not None else "",
                 description=goal[:80], cwd=str(Path.cwd().resolve()), depth=0,
                 tools=[str(schema["name"]) for schema in preview.tool_schemas()],
                 model=self._config.llm.default_model,
@@ -492,7 +519,7 @@ class AgentRunner:
             cancelled = False
             session_persisted = False
             try:
-                provider = (self._get_provider() if not context.is_done()
+                provider = (self._get_provider(budget) if not context.is_done()
                             else cast(LLMProvider, object()))
                 session_id_str = session.id if session is not None else ""
                 child_runs_dir = (
@@ -510,6 +537,7 @@ class AgentRunner:
                     child_runs_dir=child_runs_dir,
                     session_id=session_id_str,
                     tool_whitelist=tool_whitelist,
+                    budget=budget,
                 )
                 session_dir = (
                     store.session_dir(session.id)
@@ -532,8 +560,12 @@ class AgentRunner:
                     context_window=(self._config.llm.context_window
                                     or _context_window(self._config.llm.default_model)),
                     checkpoint=checkpoint.save if checkpoint is not None else None,
+                    budget=budget,
                 )
                 await loop.run(context)
+                if (context.reason == "runtime_budget" and checkpoint is not None
+                        and checkpoint.record.phase == "tools" and checkpoint.pending_tools()):
+                    checkpoint.interrupt(suspend=True)
             except asyncio.CancelledError:
                 cancelled = True
                 if not context.is_done():

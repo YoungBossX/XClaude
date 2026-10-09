@@ -6,11 +6,13 @@ from collections.abc import Callable
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
-from x_claude.core.bus.events import StepFinishedEvent, StepStartedEvent
+from x_claude.core.bus.events import LlmErrorEvent, StepFinishedEvent, StepStartedEvent
 from x_claude.core.compact.budget import estimate_tokens, truncate_tool_results
 from x_claude.core.context import ExecutionContext
 from x_claude.core.events.bus import EventBus
 from x_claude.core.llm.base import LLMProvider
+from x_claude.core.llm.errors import describe_llm_error
+from x_claude.core.resources import ResourceLimitExceeded, TaskBudget
 from x_claude.core.tools.invocation import invoke_tool
 from x_claude.core.tools.registry import ToolRegistry
 
@@ -42,6 +44,7 @@ class AgentLoop:
         tool_result_keep: int = 4_000,
         context_window: int = 0,
         checkpoint: Callable[[ExecutionContext, Phase], None] | None = None,
+        budget: TaskBudget | None = None,
     ) -> None:
         self._provider = provider
         self._registry = registry
@@ -54,14 +57,39 @@ class AgentLoop:
         self._tool_result_keep = tool_result_keep
         self._context_window = context_window
         self._checkpoint = checkpoint
+        self._budget = budget
+        self._phase: Phase = "ready"
 
     # 持久任务在推理前、工具执行前、每项观察后及完整步骤后保存检查点
     def _save_checkpoint(self, context: ExecutionContext, phase: Phase) -> None:
         if self._checkpoint is not None:
             self._checkpoint(context, phase)
+        self._phase = phase
 
     # 驱动 plan→act→observe 循环直到上下文终止；CancelledError 向上传播
     async def run(self, context: ExecutionContext) -> None:
+        if context.is_done():
+            return
+        if self._budget is None:
+            await self._run(context)
+            return
+        try:
+            async with asyncio.timeout(self._budget.remaining_s()):
+                await self._run(context)
+        except (TimeoutError, ResourceLimitExceeded) as exc:
+            code = exc.code if isinstance(exc, ResourceLimitExceeded) else "runtime_budget"
+            context.mark_failed(code)
+            # 工具中断保留未确认检查点，不能将未知副作用伪装成安全完成
+            if self._phase != "tools":
+                self._save_checkpoint(context, "finished")
+            await self._bus.publish(LlmErrorEvent(
+                run_id=context.run_id, step=context.step, code=code,
+                message="任务树资源预算已耗尽", hint="检查 /recover 状态，调整资源预算或缩小任务。",
+                ts=_now(),
+            ), isolate_errors=True)
+
+    # 执行单个 Agent 的步骤闭环，由外层约束整棵任务树的运行时限
+    async def _run(self, context: ExecutionContext) -> None:
         while not context.is_done():
             if context.step >= context.max_steps:
                 context.mark_failed("exceeded_max_steps")
@@ -106,11 +134,16 @@ class AgentLoop:
             except asyncio.CancelledError:
                 context.mark_failed("cancelled")
                 raise
-            except Exception:
+            except Exception as exc:
                 logging.getLogger(__name__).exception(
                     "LLM call failed run_id=%s step=%d", context.run_id, context.step
                 )
-                context.mark_failed("llm_error")
+                failure = describe_llm_error(exc)
+                context.mark_failed(failure.code)
+                await self._bus.publish(LlmErrorEvent(
+                    run_id=context.run_id, step=context.step, code=failure.code,
+                    message=failure.message, hint=failure.hint, ts=_now(),
+                ), isolate_errors=True)
                 self._save_checkpoint(context, "finished")
                 break
 

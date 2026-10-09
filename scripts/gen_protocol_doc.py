@@ -6,7 +6,12 @@ import argparse
 import json
 import sys
 from pathlib import Path
+from types import ModuleType
 
+from pydantic import BaseModel
+
+import x_claude
+from x_claude.core.bus import commands, events
 from x_claude.core.bus.commands import (
     AgentRunCommand,
     AgentRunResult,
@@ -96,7 +101,7 @@ def generate() -> str:
         "jsonrpc": "2.0",
         "id": "u-1",
         "result": {
-            "server_version": "0.2.0",
+            "server_version": x_claude.__version__,
             "uptime_ms": 12,
             "received_at": ts,
         },
@@ -215,7 +220,20 @@ def generate() -> str:
         "Events sent over the IPC socket (daemon → client).\n\n",
         _model_section("CoreStartedEvent", CoreStartedEvent),
         "\n## Run Events\n\n",
-        "Events written to `runs/<run_id>/events.jsonl` and forwarded over IPC to subscribed clients.\n\n",
+        "Events are written to `~/.x/sessions/<session_id>/runs/<run_id>/events.jsonl` "
+        "and forwarded over IPC. Direct standalone runners may use `runs/<run_id>/events.jsonl`.\n\n",
+        "`log_positions` carries per-log `[start, end]` byte offsets on IPC; it is reconstructed "
+        "during replay and is not stored recursively in JSONL. A client must acknowledge only "
+        "contiguous received ranges, never jump over an unseen event.\n\n",
+        "Session replay accepts `replay_offsets`; the response confirms delivered snapshot offsets. "
+        "Initial TUI history is bounded using `replay_tail_runs` / `replay_tail_bytes`; "
+        "subsequent reconnects request the complete missing suffix. Historical approvals are "
+        "not reactivated. `session.history_page` reads stored messages without executing tasks. "
+        "Message previews exceeding 16000 characters are truncated before transmission, "
+        "with an explicit notice; persisted history and model context are unchanged.\n\n",
+        "`llm.retrying` resets the incomplete text for that run. `llm.text_completed` replaces "
+        "the attempt's displayed text with the complete response. `llm.error` carries a stable "
+        "code and a safe, actionable hint.\n\n",
         _model_section("RunStartedEvent", RunStartedEvent,
             {"type": "run.started", "run_id": run_id, "goal": "总结 README.md", "ts": ts}),
         "\n",
@@ -291,9 +309,28 @@ def generate() -> str:
         "| -32601 | Method Not Found | Unknown method |\n",
         "| -32602 | Invalid Params | Parameter validation failed |\n",
         "| -32603 | Internal Error | Handler raised an unhandled exception |\n",
-        "| -32000 | Application Error | e.g. another run already in progress |\n",
+        "| -32000 | Application Error | Application-specific failure |\n",
+        "| -32001 | Unauthorized | Missing or invalid local IPC credential |\n",
+        "| -32010 | Session Not Found | Unknown session or no prior chat |\n",
+        "| -32011 | Session Closed | Session no longer accepts messages |\n",
+        "| -32012 | Session Busy | Active or unfinished task |\n",
+        "| -32030 | Recovery Review Required | Invalid checkpoint or unconfirmed recovery |\n",
     ]
-    return "".join(sections)
+    document = "".join(sections)
+    document = document.replace("\n## Server Push", _remaining_models(commands, document)
+                                + "\n## Server Push")
+    return document.replace("\n## Error Codes", _remaining_models(events, document)
+                            + "\n## Error Codes")
+
+
+# 自动补齐新增契约模型，避免生成器只覆盖早期 S0 模型或遗漏后续命令与事件
+def _remaining_models(module: ModuleType, document: str) -> str:
+    return "".join(
+        "\n" + _model_section(name, model)
+        for name, model in sorted(vars(module).items())
+        if isinstance(model, type) and issubclass(model, BaseModel)
+        and model.__module__ == module.__name__ and f"### {name}\n" not in document
+    )
 
 
 # 解析命令行参数，写出或校验 WIRE_PROTOCOL.md
