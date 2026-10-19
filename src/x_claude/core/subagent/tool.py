@@ -401,7 +401,7 @@ class SpawnAgentTool(BaseTool):
         registry = ToolRegistry()
         _all_tools = [
             ReadFileTool(),
-            BashTool(),
+            BashTool(allowed_commands=self._config.agent.allowed_shell_commands),
             WriteFileTool(),
             ListDirTool(),
         ]

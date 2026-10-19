@@ -34,6 +34,8 @@ class AgentConfig:
     max_tasks: int = 32
     max_total_tokens: int = 500_000
     max_runtime_s: float = 1800.0
+    # 固定流程可显式约束整棵任务树的 Shell 输入；None 保持普通动态任务行为。
+    allowed_shell_commands: list[str] | None = None
 
 
 @dataclass
@@ -181,6 +183,7 @@ def _apply_toml(config: XConfig, data: dict[str, Any]) -> None:
             raise SystemExit("Config error: [agent] must be a table")
         unknown_agent: set[str] = set(agent.keys()) - {
             "max_steps", "max_concurrent_llm", "max_tasks", "max_total_tokens", "max_runtime_s",
+            "allowed_shell_commands",
         }
         if unknown_agent:
             raise SystemExit(f"Unknown [agent] keys: {', '.join(sorted(unknown_agent))}")
@@ -192,6 +195,15 @@ def _apply_toml(config: XConfig, data: dict[str, Any]) -> None:
         for key in ("max_concurrent_llm", "max_tasks", "max_total_tokens", "max_runtime_s"):
             if key in agent:
                 _set_agent_limit(config.agent, key, agent[key])
+        if "allowed_shell_commands" in agent:
+            commands = agent["allowed_shell_commands"]
+            if (not isinstance(commands, list) or not commands
+                    or any(not isinstance(command, str) or not command.strip()
+                           for command in commands)):
+                raise SystemExit(
+                    "Config error: agent.allowed_shell_commands must be a non-empty string list",
+                )
+            config.agent.allowed_shell_commands = list(commands)
 
     if "llm" in data:
         llm = data["llm"]

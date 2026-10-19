@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import shutil
 import signal
 import subprocess
 from pathlib import Path
 
+from jsonschema.exceptions import ValidationError as JsonSchemaValidationError
 from pydantic import BaseModel, ConfigDict, Field
 
 from x_claude.core.tools.base import BaseTool, ToolResult
@@ -132,9 +134,47 @@ class BashTool(BaseTool):
         "required": ["command"],
     }
 
+    # 固定流程显式传入精确命令列表；仅收紧当前实例的参数契约，不授予执行权限。
+    def __init__(self, *, allowed_commands: list[str] | None = None) -> None:
+        if allowed_commands is not None and (
+            not isinstance(allowed_commands, list) or not allowed_commands
+            or any(not isinstance(command, str) or not command.strip()
+                   for command in allowed_commands)
+        ):
+            raise ValueError("allowed_commands must be a non-empty string list")
+        self._allowed_commands = tuple(allowed_commands) if allowed_commands is not None else None
+        if self._allowed_commands is not None:
+            properties = self.input_schema["properties"]
+            assert isinstance(properties, dict)
+            self.input_schema = {**self.input_schema, "properties": {
+                **properties,
+                "command": {**properties["command"], "enum": list(self._allowed_commands)},
+            }}
+            self.description += (
+                " Fixed-workflow command contract: the working directory is already set. "
+                "Submit exactly one listed command, with no cd, prefix, suffix or shell wrapper. "
+                "The contract does not grant permission; normal approval still applies."
+            )
+
+    # 参数不合约时在审批和执行前返回可纠正错误，不猜测、改写或自动执行替代命令。
+    def _validate_command(self, command: str) -> None:
+        if self._allowed_commands is not None and command not in self._allowed_commands:
+            raise JsonSchemaValidationError(
+                "command_contract: command was not executed and no approval was requested. "
+                "The working directory is already set. Correct the command within this agent; "
+                "do not spawn a replacement agent. Exact commands: "
+                + json.dumps(self._allowed_commands, ensure_ascii=False)
+                + ". This is not permission approval; never bypass a permission denial."
+            )
+
+    # 在统一工具调用的校验阶段同时检查参数类型及可选精确命令约束。
+    def validate_params(self, params: dict[str, object]) -> None:
+        self._validate_command(BashParams.model_validate(params).command)
+
     # 在子进程中执行 shell 命令，合并 stdout/stderr，超时或非零退出码时返回错误
     async def invoke(self, params: dict[str, object]) -> ToolResult:
         p = BashParams.model_validate(params)
+        self._validate_command(p.command)
         command = p.command
         timeout = p.timeout
 

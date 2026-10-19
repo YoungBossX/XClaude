@@ -31,6 +31,9 @@ def runtime_signature(config: XConfig, schemas: list[dict[str, Any]]) -> str:
         "mcp": asdict(config.mcp),
         "tools": sorted(schemas, key=lambda item: str(item["name"])),
     }
+    # 父任务即使没有 Bash 也须核对下游命令约束；默认模式不改变已有检查点指纹。
+    if config.agent.allowed_shell_commands is not None:
+        payload["allowed_shell_commands"] = config.agent.allowed_shell_commands
     raw = json.dumps(payload, sort_keys=True, ensure_ascii=False).encode("utf-8")
     return hashlib.sha256(raw).hexdigest()
 

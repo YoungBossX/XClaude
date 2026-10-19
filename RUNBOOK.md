@@ -183,6 +183,48 @@ TUI 首次续接仅载入最近 20 个运行日志、每个至多约 256 KiB 的
 - Skill 的系统提示先展开 `$ARGUMENTS`，原始斜杠输入仍保留在 thread 中。
 - MCP 参数先按 JSON Schema 校验，`isError=true` 保留为工具失败；子 Agent 可使用其角色白名单允许的 MCP 工具。
 
+### 固定任务协议与普通动态派生
+
+普通任务仍默认允许动态派生，`agent.max_tasks` 默认 32，精确 Shell 命令约束默认关闭。
+对于预先约定恰好三个子任务的固定流程，可在该流程独立的 `XConfig` 中设置：
+
+```python
+config.agent.max_tasks = 4  # 根任务也占一个名额；失败或结束的子任务不会返还名额
+config.agent.allowed_shell_commands = [
+    "python calculate.py part-0.json",
+    "python calculate.py part-1.json",
+    "python calculate.py part-2.json",
+]
+```
+
+使用 TUI 时也可在专用 TOML 的 `[agent]` 中配置这两个字段，并通过 `X_CONFIG` 启动专用 daemon。
+配置影响该 daemon 的任务，不应将固定流程限制写入供普通任务共用的全局配置。
+在提示中同时明确“总共恰好三个子任务、禁止新增替代任务、工作目录已就绪、原样使用命令”。
+数量上限只防止超额创建，不保证三个任务都完成或模型不会尝试第四次调用。
+
+`allowed_shell_commands` 是额外的参数约束，不是授权白名单或系统沙箱。
+父任务、子任务和嵌套子任务继承同一约束；Shell 输入不完全匹配时，在审批与执行前返回
+`schema_error`，内容含 `command_contract` 和“未执行”。原来的子任务可在现有步数和时间预算内自行纠正，
+运行时不自动去掉 `cd`、不代发命令、不自动重放。纠正后的命令仍走原审批规则；显式拒绝不能绕过。
+执行超时或结果不明不属于这种安全纠正，不能据此认定没有副作用。
+更换命令集合会改变恢复指纹，待恢复任务须按现有 `/recover` 机制核对。
+
+固定流程必须分别验收产物、实际派生数、成功计算、子任务终态、最终结果回收和写入顺序。
+`run.finished: success` 只表示模型循环正常结束，不能代替业务产物与协议验收。
+历史试验不重评分；变更提示或约束后的结果应标为新协议，不能与旧试验混成同一成功率。
+
+新增离线与真实 API 补测入口：
+
+```powershell
+uv run pytest tests/unit/test_fixed_command_contract.py tests/unit/test_fixed_workflow_validation.py tests/integration/test_fixed_workflow.py -q
+# 真实 API 会产生费用；使用尚不存在的新目录，pytest 的 --basetemp 会清理同名旧目录，禁止复用历史目录。
+uv run pytest tests/integration/test_live_fixed_workflow.py --run-live-api -q --basetemp=artifacts/fixed-workflow-live-NEW --junitxml=artifacts/fixed-workflow-live-NEW.xml
+```
+
+真实补测包括六组数据各三次自然运行，以及单列的原子任务内纠错诊断和普通四子任务动态派生对照。
+恢复诊断只注入初始错误工具调用，后续模型和工具均真实；不能把它计入 18 次自然运行成功率。
+每项保留独立的 `result.json`、模型轮次和事件记录，失败尝试同样保留；产物位于忽略的 `artifacts/` 下。
+
 ## 主任务与后台任务重启恢复
 
 在原项目目录启动 `uv run x-core`，再用 `uv run x-tui --continue` 或

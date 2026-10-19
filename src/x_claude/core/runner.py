@@ -384,7 +384,9 @@ class AgentRunner:
             return allowed is None or name in allowed
 
         registry = ToolRegistry()
-        for t in [ReadFileTool(), BashTool(), WriteFileTool(), ListDirTool()]:
+        for t in [ReadFileTool(),
+                  BashTool(allowed_commands=self._config.agent.allowed_shell_commands),
+                  WriteFileTool(), ListDirTool()]:
             if _ok(t.name):
                 registry.register(t)
         for t in [
