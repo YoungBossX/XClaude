@@ -57,18 +57,48 @@ async def _stop_process(proc: asyncio.subprocess.Process) -> None:
         pass
 
 
-# 在 Windows 上定位 Git Bash，优先使用 PATH，其次根据 git.exe 的安装目录推导
-def _find_windows_bash() -> str | None:
-    for name in ("bash.exe", "bash"):
-        if executable := shutil.which(name):
-            return executable
+# 限时探测 shell 能力，禁用启动脚本且只运行固定命令，不执行或重试用户任务
+def _probe_windows_bash(executable: Path) -> bool:
+    environment = dict(os.environ)
+    environment.pop("BASH_ENV", None)
+    environment.pop("ENV", None)
+    try:
+        result = subprocess.run(
+            [str(executable), "--noprofile", "--norc", "-c", "printf xclaude-bash-ready"],
+            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            timeout=2, check=False, env=environment,
+            creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+        )
+        return result.returncode == 0 and result.stdout == b"xclaude-bash-ready"
+    except (OSError, subprocess.TimeoutExpired):
+        return False
 
-    if git := shutil.which("git.exe") or shutil.which("git"):
-        git_root = Path(git).resolve().parent.parent
-        for relative_path in ("bin/bash.exe", "usr/bin/bash.exe"):
-            candidate = git_root / relative_path
-            if candidate.is_file():
-                return str(candidate)
+
+# 在 Windows 上优先选择显式配置或 Git 安装内的 Bash，并跳过系统 WSL 启动器
+def _find_windows_bash() -> str | None:
+    candidates: list[Path] = []
+    if configured := os.environ.get("X_BASH_PATH", "").strip():
+        candidate = Path(configured).expanduser()
+        if not candidate.is_absolute():
+            return None
+        candidates.append(candidate)
+    else:
+        if git := shutil.which("git.exe") or shutil.which("git"):
+            git_root = Path(git).resolve().parent.parent
+            candidates.extend(git_root / p for p in ("bin/bash.exe", "usr/bin/bash.exe"))
+        for name in ("bash.exe", "bash"):
+            if executable := shutil.which(name):
+                candidates.append(Path(executable))
+    windows = Path(os.environ.get("SystemRoot", r"C:\Windows")).resolve()
+    wsl_directories = {windows / "System32", windows / "SysWOW64", windows / "Sysnative"}
+    seen: set[Path] = set()
+    for candidate in candidates:
+        candidate = candidate.resolve()
+        if candidate in seen or candidate.parent in wsl_directories:
+            continue
+        seen.add(candidate)
+        if candidate.is_file() and _probe_windows_bash(candidate):
+            return str(candidate)
     return None
 
 
@@ -110,12 +140,13 @@ class BashTool(BaseTool):
 
         executable: str | None = None
         if os.name == "nt":
-            executable = _find_windows_bash()
+            executable = await asyncio.to_thread(_find_windows_bash)
             if executable is None:
                 return ToolResult(
                     content=(
-                        "Bash is unavailable. Install Git for Windows, or add its "
-                        "bash.exe directory to PATH."
+                        "No usable Bash found. Install Git for Windows or set X_BASH_PATH "
+                        "to its absolute bash.exe path. Check an existing X_BASH_PATH setting; "
+                        "the Windows WSL launcher is not supported."
                     ),
                     is_error=True,
                     error_type="configuration_error",

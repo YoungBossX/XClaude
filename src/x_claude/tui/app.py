@@ -527,7 +527,7 @@ class XTuiApp(App[None]):
         "[bold cyan]  ███    ██      ██      ███████ ██   ██ ██   ██ █████  [/bold cyan]\n"
         "[bold cyan] ██ ██   ██      ██      ██   ██ ██   ██ ██   ██ ██     [/bold cyan]\n"
         "[bold cyan]██   ██   █████  ███████ ██   ██  █████  ██████  ███████[/bold cyan]\n"
-        "[dim]  输入消息开始对话  ·  键入 / 触发 skill  ·  Ctrl+C 退出[/dim]"
+        "[dim]  输入消息开始对话  ·  键入 / 触发 skill  ·  Ctrl+Q 退出[/dim]"
     )
 
     # 初始化连接参数和 TUI 内部状态

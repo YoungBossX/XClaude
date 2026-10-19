@@ -42,13 +42,15 @@ async def test_compaction_persistence_failure_preserves_history(
     import os
 
     store = SessionStore(tmp_path)
-    store.append_message("sess-1", "user", "original")
+    store.append_messages("sess-1", _make_messages(), "r1")
     path = store.session_dir("sess-1") / "thread.jsonl"
     original_bytes = path.read_bytes()
     context = ExecutionContext(run_id="r1", goal="test", max_steps=5)
+    context.messages = store.read_messages("sess-1", truncate=False)
     original = context.messages
     compactor = Compactor(EventBus(), path.parent, "sess-1", store=store)
     real_replace = os.replace
+    failed_commits: list[Path] = []
 
     # 在摘要或会话文件的提交边界注入权限异常
     def fail_replace(source: object, target: object) -> None:
@@ -56,6 +58,7 @@ async def test_compaction_persistence_failure_preserves_history(
         if (failure_target == "summary" and destination.name.startswith("summary_")) or (
             failure_target == "thread" and destination == path
         ):
+            failed_commits.append(destination)
             raise PermissionError("disk commit failed")
         real_replace(source, target)  # type: ignore[arg-type]
 
@@ -63,14 +66,16 @@ async def test_compaction_persistence_failure_preserves_history(
     assert await compactor.compact(context, _stub_provider()) is None
     assert context.messages is original
     assert path.read_bytes() == original_bytes
+    assert len(failed_commits) == 1
 
 
 # 功能：验证完成通知的订阅者异常不阻止其它通知且内存磁盘状态一致
 # 设计：第一个订阅者检查提交顺序后抛异常，第二个仍收到事件，覆盖提交成功后的通知故障
 async def test_notification_failure_does_not_undo_committed_compaction(tmp_path: Path) -> None:
     store = SessionStore(tmp_path)
-    store.append_message("sess-1", "user", "original")
+    store.append_messages("sess-1", _make_messages(), "r1")
     context = ExecutionContext(run_id="r1", goal="test", max_steps=5)
+    context.messages = store.read_messages("sess-1", truncate=False)
     bus = EventBus()
     received: list[Any] = []
     snapshots: list[list[dict[str, Any]]] = []
@@ -119,7 +124,7 @@ async def test_compaction_cancellation_keeps_consistent_state(
     tmp_path: Path, cancel_after_commit: bool,
 ) -> None:
     store = SessionStore(tmp_path)
-    store.append_message("sess-1", "user", "original")
+    store.append_messages("sess-1", _make_messages(), "r1")
     context = ExecutionContext(run_id="r1", goal="test", max_steps=5)
     context.messages = store.read_messages("sess-1")
     original = context.messages
@@ -194,8 +199,8 @@ async def test_compact_messages_returns_summary(tmp_path: Path) -> None:
     assert result.summary_text == expected
 
 
-# 功能：验证 compact() 将 context.messages 替换为两条摘要消息对
-# 设计：调用 compact() 后断言 messages 长度为 2，role 分别为 user/assistant
+# 功能：验证 compact() 替换旧历史时保留摘要消息对与最新用户请求
+# 设计：检查最新请求逐字存在，避免用固定消息条数掩盖目标丢失
 async def test_compact_replaces_context_messages(tmp_path: Path) -> None:
     provider = _stub_provider()
     bus = EventBus()
@@ -205,7 +210,7 @@ async def test_compact_replaces_context_messages(tmp_path: Path) -> None:
 
     await compactor.compact(ctx, provider)
 
-    assert len(ctx.messages) == 2
+    assert ctx.messages[-1] == {"role": "user", "content": "user message " + "x" * 200}
     assert ctx.messages[0]["role"] == "user"
     assert ctx.messages[1]["role"] == "assistant"
 

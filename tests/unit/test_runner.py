@@ -244,7 +244,8 @@ async def test_auto_compaction_preserves_session_continuation(
     if should_compact:
         assert len(compaction_calls) == 1
         assert captured[1][0] == {"role": "user", "content": summary}
-        assert persisted[:2] == captured[1]
+        assert captured[1][-1] == {"role": "user", "content": "continue task"}
+        assert persisted[:len(captured[1])] == captured[1]
         assert persisted[-1]["content"] == [{"type": "text", "text": "final answer"}]
         assert len(list(store.session_dir(session.id).glob("thread_*.jsonl.bak"))) == 1
     else:

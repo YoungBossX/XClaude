@@ -461,7 +461,7 @@ class SessionManager:
                     SESSION_BUSY, "unfinished task: recover or clear before compaction"
                 )
             from x_claude.core.bus.commands import SessionCompactResult
-            from x_claude.core.compact.compactor import Compactor
+            from x_claude.core.compact.compactor import Compactor, build_compacted_messages
             messages = self._store.read_messages(sid, truncate=False)
             session_dir = self._store.session_dir(sid)
             compactor = Compactor(
@@ -472,13 +472,12 @@ class SessionManager:
             result = await compactor.compact_messages(messages, self._provider, focus=focus)
             if result is None:
                 raise HandlerError(-32021, "compaction failed or not beneficial")
-            self._store.write_compacted(sid, [
-                {"role": "user", "content": result.summary_text},
-                {"role": "assistant", "content": "Understood, I'll continue from this summary."},
-            ])
+            new_messages = build_compacted_messages(messages, result.summary_text)
+            self._store.write_compacted(sid, new_messages)
+            retained_estimate = sum(len(str(m.get("content", ""))) for m in new_messages) // 4
             return SessionCompactResult(
                 summary_tokens=result.summary_tokens,
-                saved_tokens=max(0, result.original_token_estimate - result.summary_tokens),
+                saved_tokens=max(0, result.original_token_estimate - retained_estimate),
             )
 
     # 读取指定 session 的完整 thread 历史

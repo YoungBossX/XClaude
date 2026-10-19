@@ -14,6 +14,21 @@ import pytest
 from x_claude.core.transport.auth import read_credential
 
 
+# 必须显式开启真实 API 测试，防止本机存在密钥时普通回归产生费用。
+def pytest_addoption(parser):
+    parser.addoption("--run-live-api", action="store_true", default=False,
+                     help="Allow integration-marked tests to call the configured paid model API")
+
+
+# 未显式授权时只跳过真实模型标记，不跳过本地 TCP、进程与 TUI 集成测试。
+def pytest_collection_modifyitems(config, items):
+    if not config.getoption("--run-live-api"):
+        skip = pytest.mark.skip(reason="real API disabled; pass --run-live-api explicitly")
+        for item in items:
+            if item.get_closest_marker("integration"):
+                item.add_marker(skip)
+
+
 @pytest.fixture
 def free_port() -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:

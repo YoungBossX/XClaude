@@ -110,7 +110,7 @@ async def test_agent_result_pending(tmp_path: Path) -> None:
     run_id = spawn_result.content.split("run_id=")[1].split(".")[0]
 
     result_tool = AgentResultTool(registry)
-    result = await result_tool.invoke({"run_id": run_id})
+    result = await result_tool.invoke({"run_id": run_id, "wait_ms": 0})
     assert result.content == "still running"
     assert not result.is_error
 

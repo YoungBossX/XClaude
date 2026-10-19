@@ -298,6 +298,8 @@ async def test_resumed_history_budget_is_checked_before_first_inference(tmp_path
     store = SessionStore(tmp_path)
     session = Session("s", "chat", "active", "", "t", "t")
     store.append_message(session.id, "user", "x" * 10000)
+    store.append_message(session.id, "assistant", "previous work completed")
+    store.append_message(session.id, "user", "goal")
     provider = _CaptureProvider()
     with patch.object(provider, "chat", side_effect=chat):
         result = await AgentRunner(config, provider=provider).run_and_capture(
@@ -306,4 +308,5 @@ async def test_resumed_history_budget_is_checked_before_first_inference(tmp_path
     assert result.status == "success"
     assert order == ["compact", "resumed"]
     assert store.read_messages(session.id)[0]["content"] == "short handoff"
+    assert {"role": "user", "content": "goal"} in store.read_messages(session.id)
     assert len(list(store.session_dir(session.id).glob("thread_*.bak"))) == 1

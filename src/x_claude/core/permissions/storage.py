@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from x_claude.core.atomic_file import atomic_write_bytes
+
 _DEFAULT_POLICY_PATH = Path("~/.x/policy.toml")
 
 
@@ -29,7 +31,7 @@ def load_policy_file(path: Path | None = None) -> dict[str, str]:
     return result
 
 
-# 将 {tool_name: "allow"/"deny"} 写入 policy.toml，覆盖 [always] 节
+# 将授权规则完整同步后原子替换 policy.toml，提交失败保留原文件
 def save_policy_file(always: dict[str, str], path: Path | None = None) -> None:
     p = (path or _DEFAULT_POLICY_PATH).expanduser()
     p.parent.mkdir(parents=True, exist_ok=True)
@@ -41,4 +43,4 @@ def save_policy_file(always: dict[str, str], path: Path | None = None) -> None:
     ]
     for tool, decision in sorted(always.items()):
         lines.append(f'{tool} = "{decision}"')
-    p.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    atomic_write_bytes(p, ("\n".join(lines) + "\n").encode("utf-8"))

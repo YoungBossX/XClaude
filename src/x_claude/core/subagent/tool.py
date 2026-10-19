@@ -7,7 +7,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 
 from x_claude.core.agents.loader import AgentProfile, AgentProfileLoader
 from x_claude.core.bus.events import (
@@ -85,7 +85,7 @@ class SpawnAgentTool(BaseTool):
             },
             "run_in_background": {
                 "type": "boolean",
-                "description": "When true, returns immediately with a run_id; use agent_result to poll.",  # noqa: E501
+                "description": "When true, returns immediately with a run_id; use agent_result to await the result.",  # noqa: E501
             },
             "subagent_type": {
                 "type": "string",
@@ -446,6 +446,7 @@ class SpawnAgentTool(BaseTool):
 
 class AgentResultParams(BaseModel):
     run_id: str
+    wait_ms: int = Field(default=30_000, ge=0, le=60_000)
 
 
 # 查询后台 subagent 的执行状态和最终结果
@@ -453,7 +454,8 @@ class AgentResultTool(BaseTool):
     name = "agent_result"
     description = (
         "Retrieve the result of a background sub-agent previously started with spawn_agent. "
-        "Returns 'still running' if the sub-agent has not yet completed."
+        "Waits up to 30 seconds by default without spending additional model turns. "
+        "Use wait_ms=0 only for a non-blocking status check."
     )
     input_schema: dict[str, Any] = {
         "type": "object",
@@ -461,6 +463,10 @@ class AgentResultTool(BaseTool):
             "run_id": {
                 "type": "string",
                 "description": "The run_id returned by spawn_agent(run_in_background=true)",
+            },
+            "wait_ms": {
+                "type": "integer", "minimum": 0, "maximum": 60_000, "default": 30_000,
+                "description": "Bounded wait in milliseconds; prefer waiting over polling.",
             },
         },
         "required": ["run_id"],
@@ -482,6 +488,18 @@ class AgentResultTool(BaseTool):
                 error_type="runtime_error",
             )
         task, context = entry
+        if not task.done() and p.wait_ms:
+            # 等待者超时或取消不能取消共享子任务；子任务异常仍由下方统一返回
+            try:
+                await asyncio.wait_for(asyncio.shield(task), p.wait_ms / 1000)
+            except TimeoutError:
+                pass
+            except asyncio.CancelledError:
+                current = asyncio.current_task()
+                if current is not None and current.cancelling():
+                    raise
+            except Exception:
+                pass
         if not task.done():
             return ToolResult(content="still running")
         if task.cancelled():

@@ -583,9 +583,13 @@ class AgentRunner:
                     and (checkpoint is None or checkpoint.record.context.status != "running")):
                 try:
                     # 摘要已在压缩提交时保存，仅追加本次运行尚未持久化的尾部
-                    tail = context.messages[2:] if context.messages is not initial_messages else (
-                        context.messages[prefill_len:]
-                    )
+                    if context.messages is initial_messages:
+                        tail = context.messages[prefill_len:]
+                    else:
+                        persisted = store.read_messages(session.id, truncate=False)
+                        if context.messages[:len(persisted)] != persisted:
+                            raise RuntimeError("compacted history changed before finalization")
+                        tail = context.messages[len(persisted):]
                     store.append_messages(
                         session.id, context.messages if checkpoint is not None else tail,
                         run_id=run_id, replace_history=checkpoint is not None,

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -9,7 +10,7 @@ from typing import TYPE_CHECKING, Any
 
 from x_claude.core.atomic_file import atomic_write_bytes
 from x_claude.core.bus.events import ContextCompactedEvent
-from x_claude.core.compact.budget import truncate_tool_results
+from x_claude.core.compact.budget import estimate_tokens, truncate_tool_results
 from x_claude.core.events.bus import EventBus
 
 if TYPE_CHECKING:
@@ -20,32 +21,12 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 _COMPACT_PROMPT = """\
-You are compressing an agent conversation into a handoff summary.
-Another LLM instance will continue this task from your summary alone — make it complete.
-
-Structure your response with exactly these six sections:
-
-## 1. Original Goal
-One sentence describing what the user asked the agent to accomplish.
-
-## 2. Completed Steps
-Bullet list of what has been done. Be specific (file paths, commands run, decisions made).
-
-## 3. Key Constraints & Discoveries
-Facts learned during the run that affect future decisions \
-(e.g., API limitations, file formats, user preferences stated mid-conversation).
-
-## 4. Current File State
-For each file that was created or modified: path, a one-line description of its current state.
-
-## 5. Remaining TODOs
-Ordered list of what still needs to be done to complete the original goal.
-
-## 6. Critical Data
-Any values the next LLM needs verbatim: IDs, tokens, exact error messages, config values \
-discovered during the run.
-
-Be concise. Omit reasoning steps and intermediate attempts. Keep conclusions.\
+Compress this conversation into a factual handoff, at most 1200 characters.
+Use six short labels: Goal; Done; Constraints; Files; Next; Data.
+Preserve binding decisions, exact values/types, paths and unfinished obligations.
+Distinguish completed work from proposed work. Never invent file operations or results.
+Omit repetition, review chatter and reasoning. Use the shortest sufficient wording.
+The latest user request will also be retained verbatim outside this summary.
 """
 
 
@@ -66,6 +47,25 @@ class CompactionResult:
     summary_tokens: int
 
 
+# 自动与手动压缩共享提交格式，最新用户文本请求不依赖摘要模型记忆
+def build_compacted_messages(
+    messages: list[dict[str, Any]], summary_text: str,
+) -> list[dict[str, Any]]:
+    new_messages: list[dict[str, Any]] = [
+        {"role": "user", "content": summary_text},
+        {"role": "assistant", "content": "Understood, I'll continue from this summary."},
+    ]
+    for message in reversed(messages):
+        content = message.get("content")
+        if message.get("role") == "user" and (
+            isinstance(content, str)
+            or isinstance(content, list) and any(b.get("type") == "text" for b in content)
+        ):
+            new_messages.append(dict(message))
+            break
+    return new_messages
+
+
 class Compactor:
     # 初始化压缩器，绑定事件总线、session 目录和 session ID
     def __init__(
@@ -80,6 +80,8 @@ class Compactor:
         self._timeout_s = timeout_s
         self._tool_result_limit = tool_result_limit
         self._tool_result_keep = tool_result_keep
+        self._retry_after = 0.0
+        self._failed_request_size = 0
 
     # 先保存摘要和可选会话历史，再无等待地切换内存上下文，最后发送可隔离异常的完成通知
     async def compact(
@@ -88,22 +90,31 @@ class Compactor:
         provider: LLMProvider,
         focus: str = "",
     ) -> CompactionResult | None:
+        request_size = estimate_tokens(truncate_tool_results(
+            context.messages, self._tool_result_limit, self._tool_result_keep,
+        ))
+        if (time.monotonic() < self._retry_after
+                and request_size < self._failed_request_size * 1.25):
+            return None
         result = await self.compact_messages(context.messages, provider, focus=focus)
         if result is None:
+            self._retry_after = time.monotonic() + 60.0
+            self._failed_request_size = request_size
             return None
 
         await asyncio.sleep(0)  # 在同步提交前交付待处理的取消，提交区间内不再让出执行权
-        new_messages: list[dict[str, Any]] = [
-            {"role": "user", "content": result.summary_text},
-            {"role": "assistant", "content": "Understood, I'll continue from this summary."},
-        ]
+        new_messages = build_compacted_messages(context.messages, result.summary_text)
         try:
             self._write_summary(result.summary_text)
             if self._store is not None:
                 self._store.write_compacted(self._session_id, new_messages)
         except Exception:
             logger.exception("compactor: persistence failed, retaining original history")
+            self._retry_after = time.monotonic() + 60.0
+            self._failed_request_size = request_size
             return None
+        self._retry_after = 0.0
+        self._failed_request_size = 0
         context.messages = new_messages
         await self._bus.publish(
             ContextCompactedEvent(
@@ -122,7 +133,7 @@ class Compactor:
         )
         return result
 
-    # 纯函数式压缩：接收消息列表，返回 CompactionResult；失败时返回 None
+    # 生成摘要并比较完整新旧请求的保守大小，无收益或失败时返回 None
     async def compact_messages(
         self,
         messages: list[dict[str, Any]],
@@ -135,9 +146,10 @@ class Compactor:
             len(str(m.get("content", ""))) for m in messages
         ) // 4  # 粗略 token 估算（字符数 / 4）
 
-        history_text = _messages_to_text(truncate_tool_results(
+        request_messages = truncate_tool_results(
             messages, self._tool_result_limit, self._tool_result_keep,
-        ))
+        )
+        history_text = _messages_to_text(request_messages)
         prompt = _COMPACT_PROMPT
         if focus.strip():
             prompt += f"\n\nIMPORTANT: Pay special attention to: {focus.strip()}"
@@ -164,6 +176,14 @@ class Compactor:
         summary_text = response.text.strip()
         if response.stop_reason != "end_turn" or not summary_text:
             logger.warning("compactor: summary empty or incomplete, skipping compaction")
+            return None
+
+        new_messages = truncate_tool_results(
+            build_compacted_messages(messages, summary_text),
+            self._tool_result_limit, self._tool_result_keep,
+        )
+        if estimate_tokens(new_messages) >= estimate_tokens(request_messages):
+            logger.info("compactor: no context reduction, retaining original history")
             return None
 
         summary_tokens = response.usage.output_tokens if response.usage else len(summary_text) // 4

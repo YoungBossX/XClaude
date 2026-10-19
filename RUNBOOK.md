@@ -56,6 +56,7 @@ cp .env.example .env
 | `X_CONFIG` | `~/.x/config.toml` | 覆盖配置文件路径 |
 | `X_HOST` | `127.0.0.1` | TCP 监听地址 |
 | `X_PORT` | `7437` | TCP 监听端口 |
+| `X_BASH_PATH` | 自动定位 | Windows 可选 Git Bash 绝对路径；显式配置不可用时返回配置错误，不换壳执行任务 |
 | `X_LOG_LEVEL` | `INFO` | 日志级别（DEBUG / INFO / WARNING / ERROR） |
 | `X_LOG_FILE` | `~/.x/logs/core.log` | 日志文件路径（留空则仅输出 stderr） |
 | `X_LOG_FORMAT` | `text` | 日志格式（`text` 或 `json`） |
@@ -71,6 +72,10 @@ cp .env.example .env
 自动压缩默认开启：工具调用后，输入占用加本步输出和新工具结果的保守预算达到 80% 时触发。
 首次推理和跨轮续接之前也会进行保守预算预检查；设为 0 可同时关闭自动压缩检查。
 摘要必须非空且完整生成；生成超过 60 秒、模型失败或摘要被截断时跳过压缩，保留原上下文。
+自动与手动压缩都会比较摘要、确认消息和最新用户请求组成的完整新上下文，
+仅在截断规则相同的 UTF-8 序列化大小严格减少时提交；这是保守大小比较，不保证实际账单或精确 Token 减少。
+自动压缩失败或无收益后，同一运行内退避 60 秒；实际请求大小增长至少 25% 时可以提前重试。
+手动 `/compact` 不受自动退避限制；无收益时返回提示，原历史保持不变。
 自动压缩先原子保存摘要及会话历史，再切换内存消息列表，最后发布完成事件。
 会话历史提交前会保存独立备份；序列化、写入、同步或原子替换失败时，原 `thread.jsonl` 保持完整。
 提交前取消会保留旧上下文；提交后取消会保留已经一致提交的新上下文，并向上传播取消。
@@ -86,8 +91,17 @@ cp .env.example .env
 自动压缩预算另加本步输出 Token 和截断后新工具结果的保守 UTF-8 字节估算；它不是精确分词结果，可能提前触发。
 未知模型会警告并回退到 200000 Token，必须用 `X_CONTEXT_WINDOW` 或 `[llm].context_window` 设置供应商真实容量。
 工具结果在普通推理和摘要请求中按配置截断，完整内容仍保存在运行事件和未压缩历史中。
-压缩不会额外保留最新 1–2 轮原始消息。
+压缩逐字保留最新一条用户文本请求，但不额外保留完整的最近 1–2 轮工具调用和回答。
 修改配置后需重启 `x-core` 生效。
+
+Windows Shell 优先使用 `X_BASH_PATH`，否则先从 Git 安装目录寻找，再检查 PATH；
+系统目录下的 WSL `bash.exe` 启动器不作为 Git Bash 使用。
+选定前在线程中执行最多 2 秒的固定无副作用探测，禁用探测的启动脚本，不阻塞 daemon 事件循环。
+探测成功后用户命令只执行一次；用户命令失败不会自动换壳重试。原有输出限额、超时及取消清理不变。
+
+`X_LOG_FORMAT=json` 的正文、异常与调用栈使用 JSON 转义，每条日志保持一行；文本模式格式不变。
+持久授权的 `policy.toml` 采用同目录临时文件、同步、原子替换；写入失败时旧磁盘规则保持完整。
+授权范围和当前进程内的审批语义不变；保存失败仍记录错误，不能视为新规则已跨重启持久化。
 
 ## 资源预算与前端诊断
 
@@ -230,12 +244,35 @@ TUI 中执行 `/recover` 查看 `pending_tools`，逐项检查文件、进程或
 ```bash
 uv run ruff check src tests scripts   # lint
 uv run mypy src                       # 类型检查
-uv run pytest tests/ -v               # 全量测试
+uv run pytest tests/ -v -m "not integration" # 全量本地回归，不调用真实模型
 uv run pytest tests/unit/ -v         # 仅单元测试（无需启动 daemon）
 
 make docs                             # 重新生成 WIRE_PROTOCOL.md
 make verify-s0                        # 完整验证（lint + 类型 + 测试 + 协议同源检查）
 ```
+
+### 真实 API 与 Windows 验收
+
+`integration` 标记专指真实模型 API。即使已设置密钥，也必须显式传入
+`--run-live-api` 才会执行；普通 pytest 会跳过这些用例。开启后缺少密钥会明确失败。
+在项目根目录执行，先读取现有 `.env`/TOML/环境配置，再切换到临时目录，沿用实际模型和服务地址：
+
+```powershell
+uv run pytest tests/integration/test_run_e2e.py tests/integration/test_live_compaction.py -v -m integration --run-live-api
+uv run pytest tests/integration/test_windows_acceptance.py tests/integration/test_policy_crash.py -v
+```
+
+第一条会产生 API 费用：验证真实文件读取、正确答案、自动/手动压缩后的三轮追问及无收益退避。
+每个用例最多 12 次逻辑模型调用，每次等待最多 45 秒，SDK 自动重试关闭；Provider 的流式重试仍保留。
+自动压缩验收仅降低测试触发阈值，不伪造模型用量或窗口，也不发送用户 `context.md`。
+所有文件、授权与会话产物均位于 pytest 临时目录；添加 `-o junit_family=legacy --junitxml=<新文件路径>`
+可记录模型名、服务主机、逻辑调用次数与实际用量，不记录密钥。
+
+第二条不调用真实 API：Windows 用例使用固定模型动作、真实 TCP、Textual 测试 UI、Git Bash 与审批；
+授权用例在部分写入、同步后、替换前后真实终止独立进程，再用新进程验证规则和授权结果。
+这不等同于物理断电测试。Windows 界面实机验收还应从 PowerShell 启动 `x-tui`，
+验证选择 `/clear` 后输入为空，选择 `/exit` 后返回 Shell；TUI 的退出快捷键是 `Ctrl+Q`，
+`Ctrl+C` 保留界面框架的复制/退出提示行为。`x-core` 的停止快捷键仍为 `Ctrl+C`。
 
 ---
 
