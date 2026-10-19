@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 from collections import OrderedDict
+from collections.abc import Iterator
+from contextlib import contextmanager
 from functools import partial
 from pathlib import Path
 
@@ -21,6 +23,36 @@ class BackgroundTaskRegistry:
         self._runs_dir: Path | None = None
         self._session_id = ""
         self.suspending = False
+        self._foreground_children: dict[str, dict[str, ExecutionContext]] = {}
+
+    # 仅在同步派生执行期间记录依赖；结束、异常或取消时立即移除，不持久化通知状态。
+    @contextmanager
+    def foreground_child(self, parent_run_id: str, context: ExecutionContext) -> Iterator[None]:
+        children = self._foreground_children.setdefault(parent_run_id, {})
+        children[context.run_id] = context
+        try:
+            yield
+        finally:
+            children.pop(context.run_id, None)
+            if not children:
+                self._foreground_children.pop(parent_run_id, None)
+
+    # 遍历当前查询任务的前台子调用及后台等待依赖，不等待同会话内无关任务的审批。
+    def permission_dependencies(self, run_id: str) -> tuple[str, ...]:
+        visited: set[str] = set()
+        pending: list[tuple[str, ExecutionContext | None]] = [(run_id, None)]
+        while pending:
+            current, context = pending.pop()
+            if current in visited:
+                continue
+            visited.add(current)
+            entry = self._tasks.get(current)
+            if context is None and entry is not None:
+                context = entry[1]
+            if context is not None:
+                pending.extend((child, None) for child in context.permission_wait_runs)
+            pending.extend(self._foreground_children.get(current, {}).items())
+        return tuple(sorted(visited))
 
     # 查询磁盘结果只允许绑定的会话目录，不跨会话共享索引
     def bind_storage(self, runs_dir: Path, session_id: str) -> None:

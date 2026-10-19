@@ -152,6 +152,9 @@ class PermissionManager:
             return False, "timeout"
         finally:
             self._pending.pop(key, None)
+            # 事件投递失败也必须结算通知，避免其他等待者持有永远不会完成的 Future。
+            if not future.done():
+                future.cancel()
 
         allowed = self._apply_response(raw, session_id, tool_name)
         return allowed, raw
@@ -184,6 +187,28 @@ class PermissionManager:
     def pending_events(self) -> list[dict[str, Any]]:
         return [dict(request.event) for request in self._pending.values()
                 if not request.future.done()]
+
+    # 只查询同一会话和指定依赖任务的有效审批，不让其他任务阻塞当前父循环。
+    def _pending_for_runs(
+        self, session_id: str, run_ids: tuple[str, ...],
+    ) -> list[_PendingRequest]:
+        return [request for (run_id, _), request in self._pending.items()
+                if run_id in run_ids and request.session_id == session_id
+                and not request.future.done()]
+
+    # 为结果查询区分执行中和等待用户审批，不暴露或操作其他会话的请求。
+    def has_pending_requests(self, session_id: str, run_ids: tuple[str, ...]) -> bool:
+        return bool(self._pending_for_runs(session_id, run_ids))
+
+    # 复用审批 Future 等待状态变化；父任务取消不能取消共享审批或后台子任务。
+    async def wait_for_runs(self, session_id: str, run_ids: tuple[str, ...]) -> None:
+        while pending := self._pending_for_runs(session_id, run_ids):
+            waits = [asyncio.shield(request.future) for request in pending]
+            try:
+                await asyncio.gather(*waits, return_exceptions=True)
+            finally:
+                for waiter in waits:
+                    waiter.cancel()
 
     # 应用审批决策，更新 session + persistent 缓存，返回是否放行
     def _apply_response(self, decision: str, session_id: str, tool_name: str) -> bool:

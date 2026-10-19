@@ -159,6 +159,7 @@ class AgentLoop:
             context.add_assistant_message(blocks)
 
             # [act] execute each requested tool; errors become tool results so loop continues
+            permission_wait_runs: set[str] = set()
             if response.stop_reason == "tool_use":
                 # 中断于此阶段时工具效果可能不确定，恢复不得自动重放该批调用
                 self._save_checkpoint(context, "tools")
@@ -170,6 +171,7 @@ class AgentLoop:
                         file_versions=context.file_versions,
                     )
                     context.add_tool_result(tc.id, result.content, is_error=result.is_error)
+                    permission_wait_runs.update(result.permission_wait_runs)
                     # 逐项确认已返回的结果；若提交失败，禁止继续执行后面的工具
                     self._save_checkpoint(context, "tools")
             elif response.stop_reason == "max_tokens" and response.tool_calls:
@@ -217,3 +219,12 @@ class AgentLoop:
             await self._bus.publish(
                 StepFinishedEvent(run_id=context.run_id, step=context.step, ts=_now())
             )
+            if not context.is_done() and self._permission_manager is not None:
+                # 工具结果已保存为安全步骤后等待审批，不占模型轮次；外层预算与取消仍生效。
+                context.permission_wait_runs = tuple(sorted(permission_wait_runs))
+                try:
+                    await self._permission_manager.wait_for_runs(
+                        self._session_id, context.permission_wait_runs,
+                    )
+                finally:
+                    context.permission_wait_runs = ()

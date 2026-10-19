@@ -14,6 +14,8 @@ class ToolResult:
     is_error: bool = False
     # "runtime_error" | "timeout" | "schema_error" | "permission_denied" | "file_conflict"
     error_type: str | None = None
+    # 仅供运行时等待依赖任务的审批，不作为模型参数、事件字段或持久化协议。
+    permission_wait_runs: tuple[str, ...] = ()
 
 
 class BaseTool(ABC):

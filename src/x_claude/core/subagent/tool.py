@@ -224,9 +224,10 @@ class SpawnAgentTool(BaseTool):
                 )
             )
 
-        await self._run_background(
-            child_loop, child_context, child_bus, child_run_path, child_run_id,
-        )
+        with self._task_registry.foreground_child(self._parent_run_id, child_context):
+            await self._run_background(
+                child_loop, child_context, child_bus, child_run_path, child_run_id,
+            )
 
         if child_context.status == "success":
             return ToolResult(
@@ -439,7 +440,9 @@ class SpawnAgentTool(BaseTool):
             if _allowed("spawn_agent"):
                 registry.register(nested)
             if _allowed("agent_result"):
-                registry.register(AgentResultTool(self._task_registry))
+                registry.register(AgentResultTool(
+                    self._task_registry, self._permission_manager, self._session_id,
+                ))
 
         return registry
 
@@ -473,9 +476,22 @@ class AgentResultTool(BaseTool):
     }
     params_model = AgentResultParams
 
-    # 初始化，持有共享的后台任务注册表
-    def __init__(self, task_registry: BackgroundTaskRegistry) -> None:
+    # 绑定后台任务及当前会话权限管理器，兼容无权限管理器的直接调用。
+    def __init__(
+        self, task_registry: BackgroundTaskRegistry,
+        permission_manager: PermissionManager | None = None, session_id: str = "",
+    ) -> None:
         self._task_registry = task_registry
+        self._permission_manager = permission_manager
+        self._session_id = session_id
+
+    # 包含嵌套子任务已经等待的审批依赖，避免上层只看见中间任务仍在运行。
+    def _waiting_for_approval(self, run_id: str) -> bool:
+        return self._permission_manager is not None and (
+            self._permission_manager.has_pending_requests(
+                self._session_id, self._task_registry.permission_dependencies(run_id),
+            )
+        )
 
     # 查询指定 run_id 的后台任务状态，返回结果或错误
     async def invoke(self, params: dict[str, object]) -> ToolResult:
@@ -488,7 +504,7 @@ class AgentResultTool(BaseTool):
                 error_type="runtime_error",
             )
         task, context = entry
-        if not task.done() and p.wait_ms:
+        if not task.done() and p.wait_ms and not self._waiting_for_approval(p.run_id):
             # 等待者超时或取消不能取消共享子任务；子任务异常仍由下方统一返回
             try:
                 await asyncio.wait_for(asyncio.shield(task), p.wait_ms / 1000)
@@ -501,7 +517,16 @@ class AgentResultTool(BaseTool):
             except Exception:
                 pass
         if not task.done():
-            return ToolResult(content="still running")
+            content = (
+                "waiting_for_approval: subagent is waiting for user permission. "
+                "The runtime will wait for the decision before the next model step; "
+                "query agent_result again afterwards. Do not bypass approval."
+                if self._waiting_for_approval(p.run_id) else "still running"
+            )
+            return ToolResult(
+                content=content,
+                permission_wait_runs=self._task_registry.permission_dependencies(p.run_id),
+            )
         if task.cancelled():
             return ToolResult(
                 content="Subagent was cancelled.", is_error=True, error_type="runtime_error"

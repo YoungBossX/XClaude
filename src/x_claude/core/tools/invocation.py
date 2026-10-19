@@ -140,7 +140,9 @@ async def invoke_tool(
             return await _fail(
                 bus, run_id, tool_call,
                 "permission_denied",
-                "Permission denied by user. You may not execute this command. "
+                ("Permission approval timeout; the command was not executed. "
+                 if decision == "timeout" else "Permission denied by user. ")
+                + "You may not execute this command. "
                 "Try an alternative approach or ask the user what to do.",
                 elapsed(),
             )

@@ -22,6 +22,8 @@ class ExecutionContext:
     system_prompt_override: str | None = None
     # 每个任务独立记录文件读取版本，不能继承其他 Agent 的覆盖权限
     file_versions: dict[str, str | None] = field(default_factory=dict)
+    # 临时等待依赖供上层查询传播；恢复时以实际待审批请求为准，不保存失效通知。
+    permission_wait_runs: tuple[str, ...] = ()
 
     # 初始化消息历史，优先使用 session 完整回放内容
     def __post_init__(self) -> None:
